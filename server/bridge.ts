@@ -27,7 +27,7 @@ export function health(config: BridgeConfig) {
   return { ok: true, liveConfigured: !!config.credentials && !!config.accessToken, mockAvailable: true, sessionMaxSeconds: config.maxSeconds ?? 240,
     runtimeRegion: process.env.VERCEL_REGION ?? 'local', revision: process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 12) ?? '' };
 }
-function tokenMatches(value: unknown, expected?: string): boolean {
+export function tokenMatches(value: unknown, expected?: string): boolean {
   if (typeof value !== 'string' || !expected) return false;
   const a = Buffer.from(value), b = Buffer.from(expected);
   return a.length === b.length && timingSafeEqual(a, b);

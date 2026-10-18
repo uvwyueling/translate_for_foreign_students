@@ -2,13 +2,31 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { resolve, extname, sep } from 'node:path';
 import { WebSocketServer } from 'ws';
-import { allowedOrigin, attachBridge, health, readConfig, type BridgeConfig } from './bridge.js';
+import { allowedOrigin, attachBridge, health, readConfig, tokenMatches, type BridgeConfig } from './bridge.js';
+import { runNetworkCheck } from './network-check.js';
 
-export function createApp(config: BridgeConfig = readConfig(), serveStatic = false) {
+export function createApp(config: BridgeConfig = readConfig(), serveStatic = false, networkCheck: () => Promise<unknown> = runNetworkCheck) {
+  let checkingNetwork = false, lastNetworkCheckAt: number | undefined;
   const server = createServer(async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    const path = new URL(req.url ?? '/', 'http://localhost').pathname;
+    const url = new URL(req.url ?? '/', 'http://localhost'), path = url.pathname;
+    // 查询参数在 Vercel 重写至 /api/server 后仍然保留；口令只走 HTTPS 请求头。
+    if ((path === '/api/health' || path === '/api/server') && url.searchParams.get('check') === 'network') {
+      res.setHeader('Content-Type', 'application/json');
+      if (req.method !== 'POST') { res.setHeader('Allow', 'POST'); res.writeHead(405).end(JSON.stringify({ error: 'METHOD_NOT_ALLOWED' })); return; }
+      if (!allowedOrigin(req, config.origin)) { res.writeHead(403).end(JSON.stringify({ error: 'FORBIDDEN_ORIGIN' })); return; }
+      const authorization = req.headers.authorization;
+      if (!tokenMatches(authorization?.startsWith('Bearer ') ? authorization.slice(7) : undefined, config.accessToken)) { res.writeHead(401).end(JSON.stringify({ error: 'UNAUTHORIZED' })); return; }
+      if (checkingNetwork || (lastNetworkCheckAt !== undefined && Date.now() - lastNetworkCheckAt < 30000)) {
+        res.setHeader('Retry-After', '30'); res.writeHead(429).end(JSON.stringify({ error: 'CHECK_RATE_LIMIT' })); return;
+      }
+      checkingNetwork = true; lastNetworkCheckAt = Date.now();
+      try { const result = await networkCheck(); if (!res.destroyed) res.end(JSON.stringify(result)); }
+      catch { if (!res.destroyed) res.writeHead(500).end(JSON.stringify({ error: 'NETWORK_CHECK_FAILED' })); }
+      finally { checkingNetwork = false; }
+      return;
+    }
     if (path.startsWith('/api/health') || path === '/api/server') {
       res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(health(config))); return;
     }

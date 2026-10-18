@@ -1,13 +1,14 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AddressInfo } from 'node:net';
 import WebSocket from 'ws';
 import { createApp } from '../server/app';
+import type { BridgeConfig } from '../server/bridge';
 import type { ServerEvent } from '../shared/protocol';
 
 const apps: ReturnType<typeof createApp>[] = [];
 afterEach(async () => { for (const app of apps.splice(0)) { for (const client of app.wss.clients) client.terminate(); await new Promise<void>(resolve => app.wss.close(() => resolve())); await new Promise<void>(resolve => app.server.close(() => resolve())); } });
-async function setup() {
-  const app = createApp({ maxSeconds: 60 }); apps.push(app);
+async function setup(config: BridgeConfig = { maxSeconds: 60 }, networkCheck?: () => Promise<unknown>) {
+  const app = createApp(config, false, networkCheck); apps.push(app);
   await new Promise<void>(resolve => app.server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
   return { app, origin, url: origin.replace('http:', 'ws:') + '/api/ws' };
@@ -53,5 +54,29 @@ describe('real WebSocket transport', () => {
   it('reports configuration without secrets', async () => {
     const { origin } = await setup(); const response = await fetch(origin + '/api/health');
     expect(await response.json()).toMatchObject({ ok: true, liveConfigured: false, mockAvailable: true });
+  });
+  it('requires a POST, the classroom token and the allowed origin before running a network check', async () => {
+    const check = vi.fn(async () => ({ checks: [] }));
+    const { origin } = await setup({ accessToken: 'classroom-test' }, check);
+    const url = origin + '/api/health?check=network';
+    expect((await fetch(url)).status).toBe(405);
+    expect((await fetch(url, { method: 'POST', headers: { origin } })).status).toBe(401);
+    expect((await fetch(url, { method: 'POST', headers: { origin, Authorization: 'Bearer wrong' } })).status).toBe(401);
+    expect((await fetch(url, { method: 'POST', headers: { origin: 'https://untrusted.example', Authorization: 'Bearer classroom-test' } })).status).toBe(403);
+    expect(check).not.toHaveBeenCalled();
+  });
+  it('serves only the checker result through the rewritten endpoint and limits repeated requests', async () => {
+    let finish!: (value: unknown) => void;
+    const check = vi.fn(() => new Promise<unknown>(resolve => { finish = resolve; }));
+    const { origin } = await setup({ accessToken: 'classroom-test' }, check);
+    const url = origin + '/api/server?check=network';
+    const options = { method: 'POST', headers: { origin, Authorization: 'Bearer classroom-test' } };
+    const first = fetch(url, options); await until(() => check.mock.calls.length === 1);
+    expect((await fetch(url, options)).status).toBe(429);
+    finish({ runtimeRegion: 'test', checks: [{ id: 'control', ok: true }] });
+    const response = await first; expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ runtimeRegion: 'test', checks: [{ id: 'control', ok: true }] });
+    expect((await fetch(url, options)).status).toBe(429);
+    expect(check).toHaveBeenCalledTimes(1);
   });
 });
