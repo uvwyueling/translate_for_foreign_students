@@ -18,8 +18,9 @@ class FakeSocket {
   onmessage: ((e: { data: string }) => void) | null = null;
   onerror: (() => void) | null = null;
   sent: string[] = [];
+  frames: ArrayBuffer[] = [];
   constructor() { FakeSocket.instances.push(this); }
-  send(value: string) { this.sent.push(value); }
+  send(value: string | ArrayBuffer) { if (typeof value === 'string') this.sent.push(value); else this.frames.push(value); }
   close() { this.readyState = 3; }
   open() { this.onopen?.(); }
   event(value: unknown) { this.onmessage?.({ data: JSON.stringify(value) }); }
@@ -41,6 +42,57 @@ function ready() {
   return { socket, sessionId: start.sessionId };
 }
 describe('classroom lifecycle', () => {
+  it('preserves speech captured before ready and sends it in order at real-time pace', async () => {
+    controller.setMode('live'); await controller.start();
+    const onFrame = (fakes.capture.mock.calls[0] as unknown as [(frame: ArrayBuffer) => void])[0];
+    const frames = Array.from({ length: 4 }, (_, i) => new Uint8Array(1280).fill(i + 1).buffer);
+    onFrame(frames[0]); await vi.advanceTimersByTimeAsync(40); onFrame(frames[1]);
+    expect(last().frames).toHaveLength(0);
+    const { socket } = ready();
+    expect(socket.frames).toEqual([frames[0]]);
+    // 新采到的音频必须排在连接前的音频后面，不能越过尚未发送的句首。
+    onFrame(frames[2]); await vi.advanceTimersByTimeAsync(39);
+    expect(socket.frames).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1); onFrame(frames[3]);
+    await vi.advanceTimersByTimeAsync(80);
+    expect(socket.frames).toEqual(frames);
+    expect(controller.getSnapshot().metrics.uploadedSeconds).toBeCloseTo(0.16);
+    controller.pause(); await vi.advanceTimersByTimeAsync(1000);
+    expect(socket.frames).toEqual(frames);
+  });
+  it('discards startup audio on pause and never replays it into a resumed class', async () => {
+    await controller.start();
+    const firstCapture = (fakes.capture.mock.calls[0] as unknown as [(frame: ArrayBuffer) => void])[0];
+    firstCapture(new Uint8Array(1280).fill(1).buffer);
+    controller.pause(); await controller.start();
+    const { socket } = ready(); await vi.advanceTimersByTimeAsync(80);
+    expect(socket.frames).toHaveLength(0);
+    const nextCapture = (fakes.capture.mock.calls[1] as unknown as [(frame: ArrayBuffer) => void])[0];
+    const fresh = new Uint8Array(1280).fill(2).buffer; nextCapture(fresh);
+    expect(socket.frames).toEqual([fresh]);
+    firstCapture(new Uint8Array(1280).fill(3).buffer);
+    expect(socket.frames).toEqual([fresh]);
+  });
+  it('keeps reconnect gaps separate from startup buffering', async () => {
+    await controller.start(); const first = ready();
+    const onFrame = (fakes.capture.mock.calls[0] as unknown as [(frame: ArrayBuffer) => void])[0];
+    const old = new Uint8Array(1280).fill(1).buffer;
+    onFrame(old); expect(first.socket.frames).toEqual([old]);
+    controller.simulateDisconnect(); onFrame(new Uint8Array(1280).fill(2).buffer);
+    await vi.advanceTimersByTimeAsync(1000);
+    onFrame(new Uint8Array(1280).fill(3).buffer);
+    const second = ready(); await vi.advanceTimersByTimeAsync(80);
+    expect(second.socket.frames).toHaveLength(0);
+    const fresh = new Uint8Array(1280).fill(4).buffer; onFrame(fresh);
+    expect(second.socket.frames).toEqual([fresh]);
+  });
+  it('stops with a clear error instead of silently truncating a full startup buffer', async () => {
+    await controller.start();
+    const onFrame = (fakes.capture.mock.calls[0] as unknown as [(frame: ArrayBuffer) => void])[0];
+    for (let i = 0; i < 301; i++) onFrame(new ArrayBuffer(1280));
+    expect(controller.getSnapshot()).toMatchObject({ phase: 'error', detail: 'STARTUP_AUDIO_LIMIT' });
+    expect(fakes.stop).toHaveBeenCalled(); expect(last().frames).toHaveLength(0);
+  });
   it('sends selected segmentation to the server and prevents changing it while capturing', async () => {
     expect(controller.getSnapshot().segmentation).toBe('continuous');
     controller.setMode('live'); controller.setSegmentation('pause'); await controller.start(); last().open();

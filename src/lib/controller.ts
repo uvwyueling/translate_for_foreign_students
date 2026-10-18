@@ -43,6 +43,9 @@ export class ClassroomController {
   private runningWanted = false;
   private lastPong = 0;
   private recoveryAt = 0;
+  private startupFrames: { frame: ArrayBuffer; capturedAt: number }[] = [];
+  private bufferingStartup = false;
+  private uploadTimer?: ReturnType<typeof setTimeout>;
   private frameTimes: number[] = [];
   private partialSeen = new Set<string>();
   private finalSeen = new Set<string>();
@@ -139,10 +142,11 @@ export class ClassroomController {
     const fresh = ['idle', 'ended'].includes(this.state.phase);
     if (fresh) this.patch({ metrics: emptyMetrics(), captions: [], draft: '' });
     this.runningWanted = true;
+    this.startupFrames = []; this.bufferingStartup = true;
     const generation = ++this.generation;
     this.retries = 0; this.startedAt = Date.now();
     this.player.clear(true);
-    this.patch({ phase: 'connecting', playbackError: '', detail: '', message: '正在开启麦克风并连接课堂服务…' });
+    this.patch({ phase: 'connecting', playbackError: '', detail: '', message: '正在开启麦克风并连接课堂服务…请等到“课堂进行中”后开始讲课。' });
     try {
       await this.player.unlock();
       if (generation !== this.generation) return;
@@ -151,7 +155,7 @@ export class ClassroomController {
         if (generation !== this.generation) return;
         if (!voice) { this.fail('未找到本机英语语音，请安装英语语音包或选择“讯飞英文语音”。', 'LOCAL_VOICE_UNAVAILABLE'); return; }
       }
-      await this.microphone.start(frame => this.sendFrame(frame), level => {
+      await this.microphone.start(frame => { if (generation === this.generation) this.sendFrame(frame); }, level => {
         if (generation !== this.generation) return;
         this.levelAt = Date.now(); this.patch({ level, microphone: level > 0.008 ? 'ok' : this.state.microphone });
       }, () => { if (generation === this.generation) this.fail('麦克风已断开或采音被浏览器暂停，请检查设备后手动重试。', 'MICROPHONE_INTERRUPTED'); });
@@ -167,7 +171,8 @@ export class ClassroomController {
   }
   private connect() {
     if (!this.runningWanted) return;
-    this.disconnect();
+    // 麦克风可能已经采到句首；首次连接不能清掉本次启动的短时缓存。
+    this.disconnect(true);
     this.sessionId = crypto.randomUUID();
     const sessionId = this.sessionId;
     this.frameTimes = []; this.partialSeen.clear(); this.finalSeen.clear(); this.spokenFinalIds.clear(); this.localSpeechSeq = 0; this.firstCaptionAt.clear(); this.captionTimedIds.clear(); this.player.clear(true);
@@ -194,6 +199,7 @@ export class ClassroomController {
         this.startedAt = Date.now();
         if (this.recoveryAt) { sample(this.state.metrics.recoveryMs, Date.now() - this.recoveryAt); this.recoveryAt = 0; }
         this.patch({ phase: 'running', service: 'ok', message: this.state.mode === 'mock' ? '模拟课堂进行中：字幕为固定示例，语音由浏览器朗读，与实际讲话无关。' : this.state.segmentation === 'pause' ? '停顿送译实验进行中：停顿约 0.8 秒后自动收尾并接下一段，请关注断句和翻译完整性。' : this.state.speechMode === 'local' ? '正在采集中文。收到已确认的英文字幕后，由本机英语语音朗读。' : '正在采集中文。字幕与英文语音将陆续返回。', detail: '' });
+        if (this.bufferingStartup && !this.uploadTimer) this.flushStartupFrame();
         break;
       case 'pong': this.lastPong = Date.now(); this.state.metrics.rttMs = Date.now() - message.at; break;
       case 'recognition': this.patch({ draft: message.text }); break;
@@ -234,11 +240,30 @@ export class ClassroomController {
     }
   }
   private sendFrame(frame: ArrayBuffer) {
+    if (!this.runningWanted) return;
+    const capturedAt = performance.now();
+    if (this.bufferingStartup) {
+      // 只暂存本次点击开始/继续后采到的音频，最多 12 秒（384 KB），不丢掉句首。
+      if (this.startupFrames.length >= 300) { this.fail('课堂连接等待过久，启动语音暂存已满。请检查网络后重试，并重述刚才的内容。', 'STARTUP_AUDIO_LIMIT'); return; }
+      this.startupFrames.push({ frame, capturedAt });
+      return;
+    }
+    this.uploadFrame(frame, capturedAt);
+  }
+  private flushStartupFrame() {
     if (!this.runningWanted || !this.ready || this.socket?.readyState !== WebSocket.OPEN) return;
+    const next = this.startupFrames.shift();
+    if (!next) { this.bufferingStartup = false; return; }
+    this.uploadFrame(next.frame, next.capturedAt);
+    // 新到的音频也进入同一队列，以 40 ms 节奏衔接，避免突发上传或句尾越过句首。
+    if (this.bufferingStartup && this.ready) this.uploadTimer = setTimeout(() => { this.uploadTimer = undefined; this.flushStartupFrame(); }, 40);
+  }
+  private uploadFrame(frame: ArrayBuffer, capturedAt: number) {
+    if (!this.ready || this.socket?.readyState !== WebSocket.OPEN) return;
     if (this.socket.bufferedAmount > 64000) { this.reconnect('音频发送积压，正在重连。中断内容不会补译。'); return; }
     // 最大连接 250 秒；每帧只记录采集时间，不保存音频。
     if (this.frameTimes.length >= 6500) { this.reconnect('正在切换课堂会话，交接期间可能缺少内容。', true); return; }
-    this.socket.send(frame); this.frameTimes.push(performance.now());
+    this.socket.send(frame); this.frameTimes.push(capturedAt);
     if (this.state.mode === 'live') this.state.metrics.uploadedSeconds += frame.byteLength / 32000;
   }
   private reconnect(message: string, handoff = false) {
@@ -252,8 +277,10 @@ export class ClassroomController {
     this.patch({ phase: 'reconnecting', level: 0, draft: '', message, detail: `将在 ${(delay / 1000).toFixed(1)} 秒后重建会话。已有字幕保留。` });
     this.retryTimer = setTimeout(() => this.connect(), delay);
   }
-  private disconnect() {
+  private disconnect(preserveStartupAudio = false) {
     clearTimeout(this.retryTimer); this.ready = false; this.connectionAt = 0;
+    clearTimeout(this.uploadTimer); this.uploadTimer = undefined;
+    if (!preserveStartupAudio) { this.startupFrames = []; this.bufferingStartup = false; }
     const socket = this.socket; this.socket = undefined;
     if (socket) { socket.onopen = null; socket.onmessage = null; socket.onclose = null; socket.onerror = null; socket.close(); }
     this.sessionId = '';
