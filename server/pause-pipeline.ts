@@ -1,6 +1,6 @@
 import WebSocket from 'ws';
-import { audioRequest, signedUrl, VendorDecoder, type Credentials } from './xfyun';
-import type { ServerEvent } from '../shared/protocol';
+import { audioRequest, signedUrl, VendorDecoder, type Credentials } from './xfyun.js';
+import type { ServerEvent } from '../shared/protocol.js';
 
 type Frame = { pcm: Buffer; endMs: number; voiced: boolean };
 type SocketFactory = (url: string) => WebSocket;

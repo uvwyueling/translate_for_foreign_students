@@ -8,10 +8,11 @@
   },
   "scripts": {
     "dev": "concurrently -k \"tsx watch server/local.ts\" \"vite --host 127.0.0.1\"",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && tsc -p tsconfig.server.json && vite build",
     "start": "tsx server/local.ts",
-    "test": "vitest run",
-    "check": "npm run build && npm test",
+    "test": "vitest run --dir tests",
+    "check": "npm run build && npm test && npm run test:server-runtime",
+    "test:server-runtime": "tsc -p tsconfig.server.json --noEmit false --allowImportingTsExtensions false && node --test scripts/server-runtime.test.mjs",
     "test:soak": "tsx scripts/soak.ts"
   },
   "dependencies": {

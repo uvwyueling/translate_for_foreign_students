@@ -1,5 +1,5 @@
 import { createHmac } from 'node:crypto';
-import type { ServerEvent } from '../shared/protocol';
+import type { ServerEvent } from '../shared/protocol.js';
 
 export interface Credentials { appId: string; apiKey: string; apiSecret: string }
 export function signedUrl(credentials: Credentials, now = new Date()): string {

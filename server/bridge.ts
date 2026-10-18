@@ -1,9 +1,9 @@
 import { timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import WebSocket, { WebSocketServer } from 'ws';
-import type { Mode, ServerEvent } from '../shared/protocol';
-import { audioRequest, signedUrl, VendorDecoder, type Credentials } from './xfyun';
-import { PausePipeline } from './pause-pipeline';
+import type { Mode, ServerEvent } from '../shared/protocol.js';
+import { audioRequest, signedUrl, VendorDecoder, type Credentials } from './xfyun.js';
+import { PausePipeline } from './pause-pipeline.js';
 
 const EXAMPLES = [
   ['同学们好，今天我们讨论如何提出一个清晰的问题。', 'Hello everyone. Today we will discuss how to ask a clear question.'],

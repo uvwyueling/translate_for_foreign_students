@@ -8,11 +8,18 @@
 
 1. 从本项目代码创建 Vercel 项目。框架选择 Vite，构建 `npm run build`，静态目录 `dist`，Node 版本使用兼容依赖的版本（建议 24）。
 2. 保留 `api/server.ts` 与 `vercel.json`。API 路由转发到同一个 HTTP server，`/subtitles` 回退到网页入口。
+   后端的相对导入必须使用编译后的 `.js` 后缀（如 `../server/app.js`）。项目采用 ESM，Node 不会自动补全文件扩展名。`tsconfig.server.json` 以 NodeNext 规则检查此限制；部署前运行 `npm run check`，其中会用普通 Node 加载编译后的入口并验证健康检查和模拟 WebSocket，不调用讯飞。
 3. 确认项目开启 Fluid compute，并检查实际可用的 WebSocket Beta 与时长上限。配置请求的 `maxDuration` 是 300 秒；如套餐允许值更短，必须同步调低。`SESSION_MAX_SECONDS` 必须比平台上限至少短 30 秒，默认 240。
 4. 第一轮不配讯飞凭证，先验证模拟模式。后续配置真实凭证与课堂口令，重新部署；设置准确的 `ALLOWED_ORIGIN`。
 5. 不在公开浏览器前端提供任何讯飞凭证；公开真实服务前设置足够长的随机课堂口令，教师保管。V0 采用共享口令，正式多用户访问控制留待后续版本。
 
 不要把 `npm start` 搬到教室电脑。学校教师只需浏览器打开 HTTPS 应用地址。
+
+## 500 FUNCTION_INVOCATION_FAILED 排查
+
+先在项目 Logs 查看对应请求的具体异常。2026-10-18 首次线上部署日志为 `ERR_MODULE_NOT_FOUND: Cannot find module '/var/task/server/app' imported from /var/task/api/server.js`：编译后的入口保留了无扩展名的导入，Node 在模块加载时退出。缺少讯飞配置本应返回 `ok: true, liveConfigured: false`，不会造成这个模块加载错误。
+
+本地已补全后端相对导入的 `.js` 后缀，增加 NodeNext 检查和编译产物启动测试。修复必须提交并推送到 GitHub，让 Vercel 重新部署；只重新部署旧提交不会包含修复。新部署 Ready 后重新打开 `/api/health`，期望 `ok: true`；真实模式还需要 `liveConfigured: true`。之后回首页刷新、重新检查麦克风，再验证模拟和真实连接。若仍有 500，查看新部署的最新日志，不能假定它与旧错误相同。
 
 ## 第一轮必须记录
 

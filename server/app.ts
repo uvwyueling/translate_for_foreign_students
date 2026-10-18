@@ -2,7 +2,7 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { resolve, extname, sep } from 'node:path';
 import { WebSocketServer } from 'ws';
-import { allowedOrigin, attachBridge, health, readConfig, type BridgeConfig } from './bridge';
+import { allowedOrigin, attachBridge, health, readConfig, type BridgeConfig } from './bridge.js';
 
 export function createApp(config: BridgeConfig = readConfig(), serveStatic = false) {
   const server = createServer(async (req, res) => {
