@@ -5,6 +5,7 @@ import type { Mode, ServerEvent } from '../shared/protocol.js';
 import { signedUrl, VendorDecoder, type Credentials } from './xfyun.js';
 import { PausePipeline } from './pause-pipeline.js';
 import { PcmUplink } from './pcm-uplink.js';
+import { createProviderSocket, providerConnectionFailure, providerConnectionTimeout } from './provider-connection.js';
 
 const EXAMPLES = [
   ['同学们好，今天我们讨论如何提出一个清晰的问题。', 'Hello everyone. Today we will discuss how to ask a clear question.'],
@@ -124,9 +125,13 @@ export function attachBridge(wss: WebSocketServer, config: BridgeConfig) {
         }
         let providerFailed = false;
         decoder = new VendorDecoder(sessionId, event => { if (event.type === 'error') providerFailed = true; emit(event); }, message.speechMode !== 'local');
-        upstream = new WebSocket(signedUrl(config.credentials), { handshakeTimeout: 8000, maxPayload: 2_000_000 });
+        upstream = createProviderSocket(signedUrl(config.credentials));
         uplink = new PcmUplink(upstream, config.credentials.appId, fail);
-        after(() => { if (!ready) fail('PROVIDER_TIMEOUT', '同传服务连接超时，正在重试。', true); }, 10000);
+        after(() => {
+          if (ready) return;
+          const failure = providerConnectionTimeout(upstream!);
+          fail(failure.code, failure.message, failure.retryable);
+        }, 10000);
         upstream.on('open', () => { if (disposed) return; uplink!.start(); ready = true; streamStarted = Date.now(); lastAudio = Date.now(); emit({ type: 'ready', sessionId, mode }); });
         upstream.on('message', data => {
           if (disposed) return;
@@ -137,7 +142,11 @@ export function attachBridge(wss: WebSocketServer, config: BridgeConfig) {
           response.resume();
           fail(`PROVIDER_HTTP_${response.statusCode}`, [401, 403].includes(response.statusCode ?? 0) ? '服务鉴权失败，请联系项目负责人检查凭证和服务器时间。' : '同传服务连接被拒绝，请联系项目负责人检查服务权限。', false);
         });
-        upstream.on('error', () => { if (!disposed) fail('PROVIDER_NETWORK', '无法连接同传服务，正在重试；中断内容不会补译。', true); });
+        upstream.on('error', error => {
+          if (disposed) return;
+          const failure = providerConnectionFailure(upstream!, error);
+          fail(failure.code, failure.message, failure.retryable);
+        });
         upstream.on('close', () => { if (!disposed) fail('PROVIDER_CLOSED', '同传服务连接已结束，正在重新连接。', true); });
       } catch { fail('INVALID_MESSAGE', '连接消息异常，请重新开始。', false); }
     });

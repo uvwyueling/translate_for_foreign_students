@@ -1,6 +1,7 @@
 import WebSocket from 'ws';
 import { audioRequest, signedUrl, VendorDecoder, type Credentials } from './xfyun.js';
 import type { ServerEvent } from '../shared/protocol.js';
+import { createProviderSocket, providerConnectionFailure, providerConnectionTimeout } from './provider-connection.js';
 
 type Frame = { pcm: Buffer; endMs: number; voiced: boolean };
 type SocketFactory = (url: string) => WebSocket;
@@ -28,7 +29,7 @@ export class PausePipeline {
     private ready: () => void,
     private fail: (code: string, message: string, retryable: boolean) => void,
     private emitAudio = true,
-    private makeSocket: SocketFactory = url => new WebSocket(url, { handshakeTimeout: 8000, maxPayload: 2_000_000 }),
+    private makeSocket: SocketFactory = createProviderSocket,
   ) {}
   start() { this.open(); }
   push(pcm: Buffer) {
@@ -66,7 +67,11 @@ export class PausePipeline {
       } else if (event.type === 'audio') this.emit({ ...event, seq: this.audioSeq++ });
       else this.emit(event);
     }, this.emitAudio);
-    this.deadline = setTimeout(() => { if (this.socket === socket) this.abort('SEGMENT_CONNECT_TIMEOUT', '句间服务连接超时，请重试。', true); }, 10000);
+    this.deadline = setTimeout(() => {
+      if (this.socket !== socket || this.stopped) return;
+      const failure = providerConnectionTimeout(socket);
+      this.abort(failure.code, failure.message, failure.retryable);
+    }, 10000);
     socket.on('open', () => {
       if (this.stopped || this.socket !== socket) return;
       clearTimeout(this.deadline);
@@ -86,7 +91,11 @@ export class PausePipeline {
       response.resume();
       if (this.socket === socket && !this.stopped) this.abort(`PROVIDER_HTTP_${response.statusCode}`, '同传服务拒绝连接，请检查权限、额度和凭证。', false);
     });
-    socket.on('error', () => { if (this.socket === socket && !this.stopped) this.abort('SEGMENT_NETWORK', '句间服务连接中断，正在重试；中断内容不会补译。', true); });
+    socket.on('error', error => {
+      if (this.socket !== socket || this.stopped) return;
+      const failure = providerConnectionFailure(socket, error);
+      this.abort(failure.code, failure.message, failure.retryable);
+    });
     socket.on('close', () => { if (this.socket === socket && !this.stopped) this.abort('SEGMENT_CLOSED', '句间服务意外结束，正在重试；中断内容不会补译。', true); });
   }
   private lastSendAt = 0;

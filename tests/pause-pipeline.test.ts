@@ -28,7 +28,7 @@ beforeEach(() => {
     const socket = new FakeSocket(); sockets.push(socket); return socket as unknown as WebSocket;
   });
 });
-afterEach(() => { pipeline.stop(); vi.clearAllTimers(); vi.useRealTimers(); });
+afterEach(() => { pipeline.stop(); vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
 const voiced = () => { const frame = Buffer.alloc(1280); for (let i = 0; i < frame.length; i += 2) frame.writeInt16LE(5000, i); return frame; };
 const frame = async (voice: boolean) => { pipeline.push(voice ? voiced() : Buffer.alloc(1280)); await vi.advanceTimersByTimeAsync(40); };
 describe('pause-based upstream session handoff', () => {
@@ -88,7 +88,8 @@ describe('pause-based upstream session handoff', () => {
     expect(failed).toHaveBeenCalledWith('SEGMENT_BACKLOG', expect.any(String), false);
   });
   it('times out a half-open upstream connection', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
     pipeline.start(); await vi.advanceTimersByTimeAsync(10000);
-    expect(failed).toHaveBeenCalledWith('SEGMENT_CONNECT_TIMEOUT', expect.any(String), true);
+    expect(failed).toHaveBeenCalledWith('PROVIDER_CONNECTION_TIMEOUT', expect.any(String), true);
   });
 });
