@@ -32,6 +32,22 @@ afterEach(() => { pipeline.stop(); vi.clearAllTimers(); vi.useRealTimers(); });
 const voiced = () => { const frame = Buffer.alloc(1280); for (let i = 0; i < frame.length; i += 2) frame.writeInt16LE(5000, i); return frame; };
 const frame = async (voice: boolean) => { pipeline.push(voice ? voiced() : Buffer.alloc(1280)); await vi.advanceTimersByTimeAsync(40); };
 describe('pause-based upstream session handoff', () => {
+  it('waits through temporary cloud backpressure without reconnecting or dropping the phrase', async () => {
+    pipeline.start(); sockets[0].open(); sockets[0].bufferedAmount = 65000;
+    for (let i = 0; i < 25; i++) await frame(true);
+    expect(sockets[0].sent).toHaveLength(0); expect(failed).not.toHaveBeenCalled();
+    sockets[0].bufferedAmount = 0; await vi.advanceTimersByTimeAsync(25 * 40);
+    expect(sockets[0].sent).toHaveLength(25);
+    expect(sockets[0].sent.map(item => item.payload.data.seq)).toEqual(Array.from({ length: 25 }, (_, i) => i + 1));
+    expect(failed).not.toHaveBeenCalled(); expect(sockets).toHaveLength(1);
+  });
+  it('stops a cloud send that stays blocked even when no more input arrives', async () => {
+    pipeline.start(); sockets[0].open(); sockets[0].bufferedAmount = 65000;
+    await frame(true); await vi.advanceTimersByTimeAsync(6000);
+    expect(failed).toHaveBeenCalledWith('SEGMENT_NETWORK_BACKLOG', expect.any(String), false);
+    sockets[0].bufferedAmount = 0; await vi.advanceTimersByTimeAsync(1000);
+    expect(sockets[0].sent).toHaveLength(0);
+  });
   it('ends after 800 ms silence, preserves audio output, and restarts without resetting browser audio sequence', async () => {
     pipeline.start(); sockets[0].open();
     for (let i = 0; i < 5; i++) await frame(true);

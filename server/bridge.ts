@@ -2,8 +2,9 @@ import { timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import WebSocket, { WebSocketServer } from 'ws';
 import type { Mode, ServerEvent } from '../shared/protocol.js';
-import { audioRequest, signedUrl, VendorDecoder, type Credentials } from './xfyun.js';
+import { signedUrl, VendorDecoder, type Credentials } from './xfyun.js';
 import { PausePipeline } from './pause-pipeline.js';
+import { PcmUplink } from './pcm-uplink.js';
 
 const EXAMPLES = [
   ['同学们好，今天我们讨论如何提出一个清晰的问题。', 'Hello everyone. Today we will discuss how to ask a clear question.'],
@@ -22,7 +23,8 @@ export function readConfig(): BridgeConfig {
   };
 }
 export function health(config: BridgeConfig) {
-  return { ok: true, liveConfigured: !!config.credentials && !!config.accessToken, mockAvailable: true, sessionMaxSeconds: config.maxSeconds ?? 240 };
+  return { ok: true, liveConfigured: !!config.credentials && !!config.accessToken, mockAvailable: true, sessionMaxSeconds: config.maxSeconds ?? 240,
+    runtimeRegion: process.env.VERCEL_REGION ?? 'local', revision: process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 12) ?? '' };
 }
 function tokenMatches(value: unknown, expected?: string): boolean {
   if (typeof value !== 'string' || !expected) return false;
@@ -40,8 +42,9 @@ export function attachBridge(wss: WebSocketServer, config: BridgeConfig) {
     let sessionId = '', mode: Mode = 'mock', started = false, disposed = false;
     let upstream: WebSocket | undefined;
     let decoder: VendorDecoder | undefined;
+    let uplink: PcmUplink | undefined;
     let pausePipeline: PausePipeline | undefined;
-    let seq = 0, sampleBytes = 0, ready = false, mockIndex = 0;
+    let sampleBytes = 0, ready = false, mockIndex = 0;
     let lastPing = Date.now(), lastAudio = Date.now();
     const timers = new Set<ReturnType<typeof setTimeout>>();
     const after = (fn: () => void, ms: number) => { const timer = setTimeout(() => { timers.delete(timer); if (!disposed) fn(); }, ms); timers.add(timer); };
@@ -56,7 +59,7 @@ export function attachBridge(wss: WebSocketServer, config: BridgeConfig) {
       for (const t of timers) clearTimeout(t);
       clearInterval(watchdog);
       pausePipeline?.stop();
-      if (upstream?.readyState === WebSocket.OPEN && seq > 0 && config.credentials) upstream.send(JSON.stringify(audioRequest(config.credentials.appId, Buffer.alloc(0), seq, true)));
+      uplink?.stop(true);
       upstream?.close();
       if (upstream && upstream.readyState !== WebSocket.CLOSED) { const u = upstream; const t = setTimeout(() => u.terminate(), 1000); t.unref(); }
       socket.close();
@@ -81,10 +84,7 @@ export function attachBridge(wss: WebSocketServer, config: BridgeConfig) {
         sampleBytes += audio.length;
         if (sampleBytes > (Date.now() - streamStarted + 2000) * 32) return fail('AUDIO_RATE', '音频传输过快，请重新开始。', false);
         if (pausePipeline) { pausePipeline.push(audio); return; }
-        if (mode === 'live' && upstream?.readyState === WebSocket.OPEN && config.credentials) {
-          if (upstream.bufferedAmount > 64000) return fail('UPSTREAM_BACKPRESSURE', '网络发送积压，正在重新连接；部分内容可能缺失。', true);
-          upstream.send(JSON.stringify(audioRequest(config.credentials.appId, audio, seq++)));
-        }
+        if (mode === 'live') uplink?.push(audio);
         return;
       }
       try {
@@ -125,8 +125,9 @@ export function attachBridge(wss: WebSocketServer, config: BridgeConfig) {
         let providerFailed = false;
         decoder = new VendorDecoder(sessionId, event => { if (event.type === 'error') providerFailed = true; emit(event); }, message.speechMode !== 'local');
         upstream = new WebSocket(signedUrl(config.credentials), { handshakeTimeout: 8000, maxPayload: 2_000_000 });
+        uplink = new PcmUplink(upstream, config.credentials.appId, fail);
         after(() => { if (!ready) fail('PROVIDER_TIMEOUT', '同传服务连接超时，正在重试。', true); }, 10000);
-        upstream.on('open', () => { if (disposed) return; ready = true; streamStarted = Date.now(); lastAudio = Date.now(); emit({ type: 'ready', sessionId, mode }); });
+        upstream.on('open', () => { if (disposed) return; uplink!.start(); ready = true; streamStarted = Date.now(); lastAudio = Date.now(); emit({ type: 'ready', sessionId, mode }); });
         upstream.on('message', data => {
           if (disposed) return;
           try { if (!decoder!.accept(data.toString())) { if (!providerFailed && socket.readyState === WebSocket.OPEN) emit({ type: 'handoff', sessionId }); close(); } }

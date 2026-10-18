@@ -42,6 +42,12 @@ function ready() {
   return { socket, sessionId: start.sessionId };
 }
 describe('classroom lifecycle', () => {
+  it('keeps the server failure code available while reconnecting', async () => {
+    await controller.start(); const { socket } = ready();
+    socket.event({ type: 'error', code: 'UPSTREAM_BACKPRESSURE', message: '网络发送积压', retryable: true });
+    expect(controller.getSnapshot().phase).toBe('reconnecting');
+    expect(controller.getSnapshot().detail).toContain('UPSTREAM_BACKPRESSURE');
+  });
   it('preserves speech captured before ready and sends it in order at real-time pace', async () => {
     controller.setMode('live'); await controller.start();
     const onFrame = (fakes.capture.mock.calls[0] as unknown as [(frame: ArrayBuffer) => void])[0];

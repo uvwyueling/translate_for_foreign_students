@@ -19,6 +19,7 @@ export class PausePipeline {
   private ending = false;
   private stopped = false;
   private announced = false;
+  private blockedSince?: number;
   private timer?: ReturnType<typeof setInterval>;
   private deadline?: ReturnType<typeof setTimeout>;
   constructor(
@@ -37,7 +38,7 @@ export class PausePipeline {
     for (let i = 0; i < pcm.length; i += 2) sum += (pcm.readInt16LE(i) / 32768) ** 2;
     const frame = { pcm, endMs: this.timelineMs, voiced: Math.sqrt(sum / (pcm.length / 2)) > 0.008 };
     this.queue.push(frame);
-    if (this.queue.length > 150) { this.abort('SEGMENT_BACKLOG', '句间连接等待超过 6 秒，已停止采音。请重试或改用连续同传。', false); return; }
+    if (this.queue.length > 150) { this.abort('SEGMENT_BACKLOG', '分句连接等待或音频发送积压超过 6 秒，已停止采音。请检查部署区域和服务网络后重试。', false); return; }
     if (!this.socket) {
       this.trimIdleSilence();
       if (this.queue.some(item => item.voiced)) this.open();
@@ -52,7 +53,7 @@ export class PausePipeline {
   }
   private open() {
     if (this.stopped || this.socket) return;
-    this.inputSeq = 0; this.voicedMs = 0; this.silentMs = 0; this.sentEnds = []; this.ending = false;
+    this.inputSeq = 0; this.voicedMs = 0; this.silentMs = 0; this.sentEnds = []; this.ending = false; this.blockedSince = undefined;
     const segment = ++this.segment;
     const socket = this.makeSocket(signedUrl(this.credentials)); this.socket = socket;
     this.decoder = new VendorDecoder('pipeline', event => {
@@ -94,7 +95,12 @@ export class PausePipeline {
     if (this.stopped || !socket || socket.readyState !== WebSocket.OPEN || this.ending || !this.queue.length) return;
     // push 和定时器可能同时调用；限制同一段内的发送速率。
     if (Date.now() - this.lastSendAt < 35) return;
-    if (socket.bufferedAmount > 64000) { this.abort('SEGMENT_NETWORK_BACKLOG', '网络发送积压，正在重新连接。', true); return; }
+    if (socket.bufferedAmount > 64000) {
+      this.blockedSince ??= Date.now();
+      if (Date.now() - this.blockedSince >= 6000) this.abort('SEGMENT_NETWORK_BACKLOG', '后端到讯飞的发送阻塞持续超过 6 秒，已停止采音。请检查部署区域和服务网络后重试。', false);
+      return;
+    }
+    this.blockedSince = undefined;
     const frame = this.queue.shift()!;
     this.lastSendAt = Date.now(); this.sentEnds.push(frame.endMs);
     socket.send(JSON.stringify(audioRequest(this.credentials.appId, frame.pcm, this.inputSeq++)));

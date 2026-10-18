@@ -4,6 +4,8 @@
 
 **当前默认是模拟模式。** 固定示例字幕与实际讲话无关；示例和试听通过浏览器英语语音朗读，不调用讯飞。本地真实账号已接入，用户确认中英文字幕可用；真实英文语音转发已修复，扬声器播放、45 分钟运行与学校现场验收仍待确认，不能视为可投入教学。
 
+2026-10-18 线上复测发现 Vercel → 讯飞发送积压，导致数秒后断开且无字幕。本地已准备香港区域和发送缓冲修复，尚待新部署验证；详情见[部署排查记录](docs/DEPLOYMENT.md#线上反复出现发送积压)。
+
 ## 本地运行
 
 要求 Node.js >= 22.12（本次使用 24.16）、npm，以及新版 Edge / Chrome。
@@ -48,7 +50,7 @@ npm start           # 在 3001 端口同时服务构建后的网页与后端
 
 ## 部署与验证
 
-准备了 Vercel 的 Node HTTP server 入口与路由配置，详见 [部署说明](docs/DEPLOYMENT.md)。**尚未生成部署地址，也未验证 Vercel 实际环境。** 需有可用项目权限、WebSocket Beta / Fluid compute，以及讯飞账号后继续联调。
+已部署 [Vercel 线上页面](https://translation-eta-ten.vercel.app)，Node HTTP server 入口与路由配置见 [部署说明](docs/DEPLOYMENT.md)。线上 HTTP 和 WebSocket 握手已验证，但真实语音转发出现发送积压，新修复部署与音频链路验收仍待完成。
 
 教师操作见 [操作说明](docs/TEACHER_GUIDE.md)，阶段进度与已知限制见 [实施记录](docs/IMPLEMENTATION_STATUS.md)，家庭与现场测试见 [验收清单](docs/ACCEPTANCE.md)。
 

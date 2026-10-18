@@ -38,6 +38,7 @@ export class ClassroomController {
   private generation = 0;
   private retryTimer?: ReturnType<typeof setTimeout>;
   private retries = 0;
+  private lastServiceErrorCode = '';
   private token = '';
   private ready = false;
   private runningWanted = false;
@@ -144,7 +145,7 @@ export class ClassroomController {
     this.runningWanted = true;
     this.startupFrames = []; this.bufferingStartup = true;
     const generation = ++this.generation;
-    this.retries = 0; this.startedAt = Date.now();
+    this.retries = 0; this.lastServiceErrorCode = ''; this.startedAt = Date.now();
     this.player.clear(true);
     this.patch({ phase: 'connecting', playbackError: '', detail: '', message: '正在开启麦克风并连接课堂服务…请等到“课堂进行中”后开始讲课。' });
     try {
@@ -236,7 +237,10 @@ export class ClassroomController {
       case 'audio': if (this.state.mode === 'live' && this.state.speechMode === 'provider') this.player.enqueue({ seq: message.seq, pcm: message.pcm, sampleRate: message.sampleRate }); break;
       case 'mock-speech': if (this.state.mode === 'mock') this.player.enqueue({ seq: message.seq, text: message.text }); break;
       case 'handoff': this.reconnect('正在交接到新会话，交接区间可能缺少内容；请重述关键句。', true); break;
-      case 'error': if (message.retryable) this.reconnect(message.message); else this.fail(message.message, message.code); break;
+      case 'error':
+        this.lastServiceErrorCode = message.code;
+        if (message.retryable) this.reconnect(message.message); else this.fail(message.message, message.code);
+        break;
     }
   }
   private sendFrame(frame: ArrayBuffer) {
@@ -270,11 +274,11 @@ export class ClassroomController {
     if (!this.runningWanted) return;
     this.disconnect(); this.player.clear(true); this.state.metrics.interruptions++;
     this.recoveryAt ||= Date.now();
-    if (!handoff && this.retries >= 5) { this.fail('多次重连失败，已停止采音。请检查网络后手动重试。', 'RETRY_EXHAUSTED'); return; }
+    if (!handoff && this.retries >= 5) { this.fail('多次重连失败，已停止采音。请检查网络后手动重试。', this.lastServiceErrorCode ? `RETRY_EXHAUSTED / ${this.lastServiceErrorCode}` : 'RETRY_EXHAUSTED'); return; }
     if (handoff) this.retries = 0;
     const delay = handoff ? 250 : Math.min(1000 * 2 ** this.retries++, 16000);
     this.state.metrics.reconnects++;
-    this.patch({ phase: 'reconnecting', level: 0, draft: '', message, detail: `将在 ${(delay / 1000).toFixed(1)} 秒后重建会话。已有字幕保留。` });
+    this.patch({ phase: 'reconnecting', level: 0, draft: '', message, detail: `${this.lastServiceErrorCode ? `${this.lastServiceErrorCode} · ` : ''}将在 ${(delay / 1000).toFixed(1)} 秒后重建会话。已有字幕保留。` });
     this.retryTimer = setTimeout(() => this.connect(), delay);
   }
   private disconnect(preserveStartupAudio = false) {
@@ -321,6 +325,7 @@ export class ClassroomController {
     const { partialLatencyMs, finalLatencyMs, recoveryMs, audioQueueWaitMs, captionConfirmationMs, localSpeechStartMs, ...counters } = this.state.metrics;
     const report = {
       version: 'v0', mode: this.state.mode, speechMode: this.state.speechMode, segmentation: this.state.segmentation, createdAt: new Date().toISOString(),
+      lastServiceErrorCode: this.lastServiceErrorCode || null,
       ...counters, partialSubtitleLatency: summarize(partialLatencyMs), finalSubtitleLatency: summarize(finalLatencyMs), recovery: summarize(recoveryMs), audioQueueWait: summarize(audioQueueWaitMs),
       captionConfirmation: summarize(captionConfirmationMs), localCaptionToSpeechStart: summarize(localSpeechStartMs),
       latestStageTimings: { captionConfirmationMs: captionConfirmationMs.at(-1) ?? null, localCaptionToSpeechStartMs: localSpeechStartMs.at(-1) ?? null },
