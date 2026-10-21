@@ -1,5 +1,5 @@
 import { useEffect, useState, useSyncExternalStore } from 'react';
-import { ClassroomController, phaseLabels } from './lib/controller';
+import { ClassroomController, phaseLabels, type ClassroomState } from './lib/controller';
 import { summarize } from './lib/metrics';
 import type { Caption } from '../shared/protocol';
 
@@ -11,6 +11,20 @@ function Captions({ captions }: { captions: Caption[] }) {
       <p className="zh">{row.zh}</p><p className="en" lang="en">{row.en}</p>
     </article>) : <div className="empty"><span className="empty-symbol">Aa</span><h3>让每一句话，都被听懂</h3><p>开始课堂后，中文识别与英文翻译将在这里显示。</p></div>}
   </div>;
+}
+function CaptureStatus({ state }: { state: ClassroomState }) {
+  const stages = { idle: '尚未启动', permission: '等待麦克风授权', resuming: '正在启动浏览器音频', worklet: '正在加载采音模块', capturing: '采音已启动', stopped: '已停止' };
+  const capture = state.capture;
+  return <><div className="metric-grid">
+    <div><small>采音阶段</small><strong>{stages[capture.stage]}</strong></div>
+    <div><small>浏览器采音状态 / 采样率</small><strong>{capture.contextState} / {capture.sampleRate ?? '—'} Hz</strong></div>
+    <div><small>麦克风通道</small><strong>{capture.trackState === 'unavailable' ? '尚未取得' : capture.trackState === 'ended' ? '已断开' : !capture.trackEnabled ? '已禁用' : capture.trackMuted ? '系统暂时静音' : '正常'}</strong></div>
+    <div><small>采音模块</small><strong>{capture.workletReady ? '已就绪' : '尚未就绪'}</strong></div>
+    <div><small>采音回调 / 有输入回调</small><strong>{capture.renderCallbacks} / {capture.inputCallbacks}</strong></div>
+    <div><small>已采集音频</small><strong>{capture.frames} 帧 / {(capture.frames * 0.04).toFixed(2)} 秒</strong></div>
+    <div><small>网页已发往课堂服务</small><strong>{state.sentFrames} 帧</strong></div>
+    <div><small>启动音频等待发送</small><strong>{state.pendingFrames} 帧</strong></div>
+  </div><p>故障时保留停止前的采音状态。网页发出帧数只表示已交给浏览器连接发送，不证明后端或讯飞已收到；模拟模式也可检查采音和网页发送。</p></>;
 }
 export default function App({ controller }: { controller: ClassroomController }) {
   const state = useSyncExternalStore(controller.subscribe, controller.getSnapshot);
@@ -59,7 +73,7 @@ export default function App({ controller }: { controller: ClassroomController })
           <div className="subtitle-footer"><span>字幕先显示，英文语音按顺序播放。</span><span>仅保留本次页面最近 60 条</span></div>
         </section>
       </div>
-      <section className="diagnostics"><button className="text-button" onClick={() => setShowDiagnostics(!showDiagnostics)} aria-expanded={showDiagnostics}>{showDiagnostics ? '▾' : '▸'} 运行数据与排查</button><span>音频与课堂字幕不写入数据库</span>{showDiagnostics && <div className="diagnostic-body"><div className="metric-grid"><div><small>连接往返耗时</small><strong>{state.metrics.rttMs === null ? '—' : `${state.metrics.rttMs} ms`}</strong></div><div><small>上传用量估算</small><strong>{(state.metrics.uploadedSeconds / 60).toFixed(2)} 分钟</strong></div><div><small>重建 / 中断次数</small><strong>{state.metrics.reconnects} / {state.metrics.interruptions}</strong></div><div><small>最大待播</small><strong>{state.metrics.maxQueueSeconds.toFixed(1)} 秒</strong></div><div><small>最近音频的网页排队等待</small><strong>{state.metrics.audioQueueWaitMs.length ? `${(state.metrics.audioQueueWaitMs.at(-1)! / 1000).toFixed(2)} 秒` : "—"}</strong></div><div><small>英文字幕首次出现→确认（最近）</small><strong>{state.metrics.captionConfirmationMs.length ? `${(state.metrics.captionConfirmationMs.at(-1)! / 1000).toFixed(2)} 秒` : "—"}</strong></div><div><small>确认→本机朗读启动（最近）</small><strong>{state.metrics.localSpeechStartMs.length ? `${(state.metrics.localSpeechStartMs.at(-1)! / 1000).toFixed(2)} 秒` : "—"}</strong></div><div><small>最终字幕延迟中位数（近似）</small><strong>{summarize(state.metrics.finalLatencyMs)?.medianMs ?? '—'} ms</strong></div></div><p>连接往返耗时不代表翻译延迟。模拟模式不产生真实翻译延迟数据；网页排队等待不包含云端处理、网络和声卡延迟；本机朗读启动依据浏览器开始事件，不代表扬声器发声时刻；两项最近值可能属于不同片段，不能直接相加。英文起播延迟待人工标记实测。</p>{state.detail && <p className="error-note">排查信息：{state.detail}</p>}<div className="button-pair"><button onClick={() => controller.exportMetrics()}>下载运行数据（不含课堂正文）</button><button disabled={!active} onClick={() => controller.simulateDisconnect()}>测试断连恢复</button></div></div>}</section>
+      <section className="diagnostics"><button className="text-button" onClick={() => setShowDiagnostics(!showDiagnostics)} aria-expanded={showDiagnostics}>{showDiagnostics ? '▾' : '▸'} 运行数据与排查</button><span>音频与课堂字幕不写入数据库</span>{showDiagnostics && <div className="diagnostic-body"><div className="metric-grid"><div><small>连接往返耗时</small><strong>{state.metrics.rttMs === null ? '—' : `${state.metrics.rttMs} ms`}</strong></div><div><small>上传用量估算</small><strong>{(state.metrics.uploadedSeconds / 60).toFixed(2)} 分钟</strong></div><div><small>重建 / 中断次数</small><strong>{state.metrics.reconnects} / {state.metrics.interruptions}</strong></div><div><small>最大待播</small><strong>{state.metrics.maxQueueSeconds.toFixed(1)} 秒</strong></div><div><small>最近音频的网页排队等待</small><strong>{state.metrics.audioQueueWaitMs.length ? `${(state.metrics.audioQueueWaitMs.at(-1)! / 1000).toFixed(2)} 秒` : "—"}</strong></div><div><small>英文字幕首次出现→确认（最近）</small><strong>{state.metrics.captionConfirmationMs.length ? `${(state.metrics.captionConfirmationMs.at(-1)! / 1000).toFixed(2)} 秒` : "—"}</strong></div><div><small>确认→本机朗读启动（最近）</small><strong>{state.metrics.localSpeechStartMs.length ? `${(state.metrics.localSpeechStartMs.at(-1)! / 1000).toFixed(2)} 秒` : "—"}</strong></div><div><small>最终字幕延迟中位数（近似）</small><strong>{summarize(state.metrics.finalLatencyMs)?.medianMs ?? '—'} ms</strong></div></div><CaptureStatus state={state}/><p>连接往返耗时不代表翻译延迟。模拟模式不产生真实翻译延迟数据；网页排队等待不包含云端处理、网络和声卡延迟；本机朗读启动依据浏览器开始事件，不代表扬声器发声时刻；两项最近值可能属于不同片段，不能直接相加。英文起播延迟待人工标记实测。</p>{state.detail && <p className="error-note">排查信息：{state.detail}</p>}<div className="button-pair"><button onClick={() => controller.exportMetrics()}>下载运行数据（不含课堂正文）</button><button disabled={!active} onClick={() => controller.simulateDisconnect()}>测试断连恢复</button></div></div>}</section>
       <footer className="page-footer"><span>听见课堂 / V0</span><span>试验阶段 · 真实服务与学校设备仍需联调验收</span></footer>
     </main>
   </div>;

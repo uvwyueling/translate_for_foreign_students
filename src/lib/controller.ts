@@ -1,5 +1,5 @@
 import { MAX_CAPTIONS, upsertCaption, type Caption, type Mode, type Phase, type ServerEvent, type SpeechMode, type Segmentation } from '../../shared/protocol';
-import { Microphone } from '../audio/capture';
+import { Microphone, emptyCaptureDiagnostics, type CaptureDiagnostics, type CaptureFailure } from '../audio/capture';
 import { AudioPlayer } from '../audio/player';
 import { waitForLocalEnglishVoice } from '../audio/local-voice';
 import { emptyMetrics, sample, summarize, type Metrics } from './metrics';
@@ -10,11 +10,13 @@ export interface ClassroomState {
   service: 'unchecked' | 'ok' | 'error'; liveConfigured: boolean;
   message: string; detail: string; playbackError: string; queueSeconds: number; playing: boolean;
   volume: number; metrics: Metrics; projectionOpen: boolean;
+  capture: CaptureDiagnostics; sentFrames: number; pendingFrames: number;
 }
 export const initialState = (): ClassroomState => ({
   phase: 'idle', mode: 'mock', speechMode: 'provider', segmentation: 'continuous', captions: [], draft: '', level: 0, microphone: 'unchecked',
   service: 'unchecked', liveConfigured: false, message: '先完成课前检查，再开始课堂。', detail: '',
   playbackError: '', queueSeconds: 0, playing: false, volume: 0.8, metrics: emptyMetrics(), projectionOpen: false,
+  capture: emptyCaptureDiagnostics(), sentFrames: 0, pendingFrames: 0,
 });
 export const phaseLabels: Record<Phase, string> = { idle: '待开始', checking: '课前检查中', connecting: '正在连接', running: '课堂进行中', paused: '已暂停', reconnecting: '正在重连', error: '需要处理', ended: '课堂已结束' };
 export function browserCapabilities() {
@@ -54,7 +56,8 @@ export class ClassroomController {
   private localSpeechSeq = 0;
   private firstCaptionAt = new Map<string, number>();
   private captionTimedIds = new Set<string>();
-  private levelAt = Date.now();
+  private frameAt: number | undefined;
+  private audioStartingAt: number | undefined;
   private startedAt = 0;
   private connectionAt = 0;
   private channelId = crypto.randomUUID();
@@ -96,7 +99,7 @@ export class ClassroomController {
         if (generation !== this.generation) return;
         heard ||= level > 0.008;
         this.patch({ level, microphone: heard ? 'ok' : 'checking' });
-      }, () => { if (generation === this.generation) this.fail('麦克风被断开或浏览器暂停采音，请检查后重试。', 'MICROPHONE_INTERRUPTED'); });
+      }, code => { if (generation === this.generation) this.captureFailure(code); });
       if (generation !== this.generation) return;
       setTimeout(() => {
         if (generation !== this.generation) return;
@@ -143,14 +146,16 @@ export class ClassroomController {
     const fresh = ['idle', 'ended'].includes(this.state.phase);
     if (fresh) this.patch({ metrics: emptyMetrics(), captions: [], draft: '' });
     this.runningWanted = true;
+    this.frameAt = undefined; this.audioStartingAt = Date.now();
     this.startupFrames = []; this.bufferingStartup = true;
     const generation = ++this.generation;
     this.retries = 0; this.lastServiceErrorCode = ''; this.startedAt = Date.now();
     this.player.clear(true);
-    this.patch({ phase: 'connecting', playbackError: '', detail: '', message: '正在开启麦克风并连接课堂服务…请等到“课堂进行中”后开始讲课。' });
+    this.patch({ phase: 'connecting', playbackError: '', detail: '', sentFrames: 0, pendingFrames: 0, capture: emptyCaptureDiagnostics(), message: '正在开启麦克风并连接课堂服务…请等到“课堂进行中”后开始讲课。' });
     try {
-      await this.player.unlock();
+      await Promise.all([this.player.unlock(), this.microphone.prepare()]);
       if (generation !== this.generation) return;
+      this.audioStartingAt = undefined;
       if (this.state.mode === 'live' && this.state.speechMode === 'local') {
         const voice = await waitForLocalEnglishVoice();
         if (generation !== this.generation) return;
@@ -158,12 +163,16 @@ export class ClassroomController {
       }
       await this.microphone.start(frame => { if (generation === this.generation) this.sendFrame(frame); }, level => {
         if (generation !== this.generation) return;
-        this.levelAt = Date.now(); this.patch({ level, microphone: level > 0.008 ? 'ok' : this.state.microphone });
-      }, () => { if (generation === this.generation) this.fail('麦克风已断开或采音被浏览器暂停，请检查设备后手动重试。', 'MICROPHONE_INTERRUPTED'); });
+        this.patch({ level, microphone: level > 0.008 ? 'ok' : this.state.microphone });
+      }, code => { if (generation === this.generation) this.captureFailure(code); });
       if (generation !== this.generation) return;
-      this.levelAt = Date.now();
+      this.frameAt ??= Date.now();
       this.connect();
     } catch (error) { if (generation === this.generation) this.micFailure(error); }
+  }
+  private captureFailure(code: CaptureFailure) {
+    const message = code === 'CAPTURE_PROCESSOR_ERROR' ? '浏览器采音处理发生错误，请刷新页面重试，或使用新版 Edge / Chrome。' : code === 'CAPTURE_TRACK_ENDED' ? '麦克风已断开，请检查设备后手动重试。' : '浏览器暂停了采音，请保持页面在前台后手动重试。';
+    this.fail(message, code); this.patch({ microphone: 'error' });
   }
   private micFailure(error: unknown) {
     const name = error instanceof DOMException ? error.name : '';
@@ -245,6 +254,7 @@ export class ClassroomController {
   }
   private sendFrame(frame: ArrayBuffer) {
     if (!this.runningWanted) return;
+    this.frameAt = Date.now();
     const capturedAt = performance.now();
     if (this.bufferingStartup) {
       // 只暂存本次点击开始/继续后采到的音频，最多 12 秒（384 KB），不丢掉句首。
@@ -267,7 +277,7 @@ export class ClassroomController {
     if (this.socket.bufferedAmount > 64000) { this.reconnect('音频发送积压，正在重连。中断内容不会补译。'); return; }
     // 最大连接 250 秒；每帧只记录采集时间，不保存音频。
     if (this.frameTimes.length >= 6500) { this.reconnect('正在切换课堂会话，交接期间可能缺少内容。', true); return; }
-    this.socket.send(frame); this.frameTimes.push(capturedAt);
+    this.socket.send(frame); this.frameTimes.push(capturedAt); this.state.sentFrames++;
     if (this.state.mode === 'live') this.state.metrics.uploadedSeconds += frame.byteLength / 32000;
   }
   private reconnect(message: string, handoff = false) {
@@ -290,10 +300,12 @@ export class ClassroomController {
     this.sessionId = '';
   }
   private fail(message: string, detail: string) {
-    this.stopResources(); this.patch({ phase: 'error', message, detail, level: 0, draft: '' });
+    const capture = this.microphone.diagnostics, pendingFrames = this.startupFrames.length;
+    this.stopResources(); this.patch({ phase: 'error', message, detail, level: 0, draft: '', capture, pendingFrames });
   }
   private stopResources() {
-    this.runningWanted = false; this.generation++; this.disconnect(); this.microphone.stop(); this.player.clear(true);
+    this.runningWanted = false; this.frameAt = undefined; this.audioStartingAt = undefined;
+    this.generation++; this.disconnect(); this.microphone.stop(); this.player.clear(true);
   }
   pause() { this.stopResources(); this.patch({ phase: 'paused', level: 0, draft: '', message: '已停止采音和播放。继续时建立新会话，暂停期间的内容不会补译。', detail: '' }); }
   end() { this.stopResources(); this.patch({ phase: 'ended', level: 0, draft: '', message: '课堂已结束，麦克风与连接已释放。当前字幕保留至刷新或关闭页面。', detail: '' }); }
@@ -316,16 +328,25 @@ export class ClassroomController {
       else this.socket.send(JSON.stringify({ type: 'ping', at: Date.now() }));
     }
     if (this.runningWanted && !this.ready && this.connectionAt && Date.now() - this.connectionAt > 12000) this.reconnect('课堂服务连接超时，正在重试。');
-    if (this.runningWanted && Date.now() - this.levelAt > 10000) this.fail('麦克风长时间没有返回音频，请检查设备和浏览器后重试。', 'CAPTURE_STALLED');
+    if (this.runningWanted && this.audioStartingAt !== undefined && Date.now() - this.audioStartingAt > 10000)
+      this.fail('浏览器未能启动音频，请保持页面在前台后手动重试，或使用新版 Edge / Chrome。', 'AUDIO_START_TIMEOUT');
+    const capture = this.microphone.diagnostics;
+    if ((this.runningWanted || this.state.phase === 'checking') && ['resuming', 'worklet'].includes(capture.stage) && Date.now() - capture.stageAt > 10000)
+      this.fail('浏览器采音模块启动超时，请刷新页面重试，或使用新版 Edge / Chrome。', 'CAPTURE_START_TIMEOUT');
+    if (this.runningWanted && this.frameAt !== undefined && Date.now() - this.frameAt > 10000)
+      this.fail('麦克风长时间没有生成音频帧，请检查运行数据后手动重试。', 'CAPTURE_STALLED');
     if (this.player.stalled) this.patch({ playbackError: '英文音频存在缺片，请清空待播或手动重试。' });
     if (this.startedAt && this.ready && Date.now() - this.startedAt > 30000) this.retries = 0;
-    this.patch({ queueSeconds: this.player.seconds, playing: this.player.isPlaying, metrics: { ...this.state.metrics }, projectionOpen: !!this.projection && !this.projection.closed });
+    this.patch({ queueSeconds: this.player.seconds, playing: this.player.isPlaying, metrics: { ...this.state.metrics }, projectionOpen: !!this.projection && !this.projection.closed,
+      ...(this.state.phase === 'error' ? {} : { capture: this.microphone.diagnostics, pendingFrames: this.startupFrames.length }) });
   }
   exportMetrics() {
     const { partialLatencyMs, finalLatencyMs, recoveryMs, audioQueueWaitMs, captionConfirmationMs, localSpeechStartMs, ...counters } = this.state.metrics;
     const report = {
       version: 'v0', mode: this.state.mode, speechMode: this.state.speechMode, segmentation: this.state.segmentation, createdAt: new Date().toISOString(),
       lastServiceErrorCode: this.lastServiceErrorCode || null,
+      lastDiagnosticCode: this.state.detail || null,
+      capture: this.state.capture, sentFrames: this.state.sentFrames, pendingFrames: this.state.pendingFrames,
       ...counters, partialSubtitleLatency: summarize(partialLatencyMs), finalSubtitleLatency: summarize(finalLatencyMs), recovery: summarize(recoveryMs), audioQueueWait: summarize(audioQueueWaitMs),
       captionConfirmation: summarize(captionConfirmationMs), localCaptionToSpeechStart: summarize(localSpeechStartMs),
       latestStageTimings: { captionConfirmationMs: captionConfirmationMs.at(-1) ?? null, localCaptionToSpeechStartMs: localSpeechStartMs.at(-1) ?? null },

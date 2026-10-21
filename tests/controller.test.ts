@@ -1,12 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-const fakes = vi.hoisted(() => ({ stop: vi.fn(), capture: vi.fn(async () => {}), audioClear: vi.fn(), enqueue: vi.fn(), voice: vi.fn(async () => ({ lang: 'en-US', localService: true })) }));
-vi.mock('../src/audio/capture', () => ({ Microphone: class { start = fakes.capture; stop = fakes.stop; } }));
+const fakes = vi.hoisted(() => ({ diagnostics: vi.fn(), prepare: vi.fn(async () => {}), unlock: vi.fn(async () => {}), stop: vi.fn(), capture: vi.fn(async () => {}), audioClear: vi.fn(), enqueue: vi.fn(), voice: vi.fn(async () => ({ lang: 'en-US', localService: true })) }));
+vi.mock('../src/audio/capture', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/audio/capture')>();
+  return { ...actual, Microphone: class { start = fakes.capture; stop = fakes.stop; prepare = fakes.prepare; get diagnostics() { return fakes.diagnostics() ?? actual.emptyCaptureDiagnostics(); } } };
+});
 vi.mock('../src/audio/local-voice', () => ({ waitForLocalEnglishVoice: fakes.voice }));
 vi.mock('../src/audio/player', () => ({ AudioPlayer: class {
   constructor(private changed: () => void) {}
   seconds = 0; isPlaying = false; stalled = false;
   clear = fakes.audioClear; enqueue = fakes.enqueue;
-  unlock = vi.fn(async () => {}); setVolume = vi.fn(); dispose = vi.fn(() => this.changed());
+  unlock = fakes.unlock; setVolume = vi.fn(); dispose = vi.fn(() => this.changed());
 } }));
 import { ClassroomController } from '../src/lib/controller';
 class FakeSocket {
@@ -27,7 +30,7 @@ class FakeSocket {
 }
 let controller: ClassroomController;
 beforeEach(() => {
-  vi.useFakeTimers(); vi.clearAllMocks(); FakeSocket.instances = [];
+  vi.useFakeTimers(); vi.clearAllMocks(); fakes.diagnostics.mockReturnValue(undefined); FakeSocket.instances = [];
   vi.stubGlobal('window', { isSecureContext: true, AudioContext: class {}, AudioWorkletNode: class {}, WebSocket: FakeSocket });
   vi.stubGlobal('navigator', { mediaDevices: { getUserMedia: vi.fn() } });
   vi.stubGlobal('location', { href: 'http://localhost/', protocol: 'http:' });
@@ -42,6 +45,66 @@ function ready() {
   return { socket, sessionId: start.sessionId };
 }
 describe('classroom lifecycle', () => {
+  it('does not count idle time or a pending microphone permission as stalled capture', async () => {
+    await vi.advanceTimersByTimeAsync(20000);
+    let resolveCapture!: () => void;
+    fakes.capture.mockImplementationOnce(() => new Promise<void>(resolve => { resolveCapture = resolve; }));
+    const starting = controller.start(); await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(controller.getSnapshot().phase).toBe('connecting');
+    resolveCapture(); await starting;
+    expect(FakeSocket.instances).toHaveLength(1);
+  });
+  it('uses arriving PCM frames as capture progress even when level events stop', async () => {
+    await controller.start(); ready();
+    const onFrame = (fakes.capture.mock.calls[0] as unknown as [(frame: ArrayBuffer) => void])[0];
+    for (let i = 0; i < 12; i++) { onFrame(new ArrayBuffer(1280)); await vi.advanceTimersByTimeAsync(1000); }
+    expect(controller.getSnapshot().phase).toBe('running');
+    expect(last().frames).toHaveLength(12);
+  });
+  it('prepares capture in the click handler before waiting for playback unlock', async () => {
+    let resolveUnlock!: () => void;
+    fakes.unlock.mockImplementationOnce(() => new Promise<void>(resolve => { resolveUnlock = resolve; }));
+    const starting = controller.start();
+    expect(fakes.prepare).toHaveBeenCalledTimes(1);
+    expect(fakes.capture).not.toHaveBeenCalled();
+    resolveUnlock(); await starting;
+    expect(fakes.capture).toHaveBeenCalledTimes(1);
+  });
+  it('reports blocked audio startup separately from stalled capture', async () => {
+    let resolveUnlock!: () => void;
+    fakes.unlock.mockImplementationOnce(() => new Promise<void>(resolve => { resolveUnlock = resolve; }));
+    const starting = controller.start();
+    await vi.advanceTimersByTimeAsync(11000);
+    expect(controller.getSnapshot()).toMatchObject({ phase: 'error', detail: 'AUDIO_START_TIMEOUT' });
+    resolveUnlock(); await starting;
+    expect(FakeSocket.instances).toHaveLength(0);
+  });
+  it('detects missing PCM frames even if the volume meter still updates', async () => {
+    await controller.start(); ready();
+    const onLevel = (fakes.capture.mock.calls[0] as unknown as [unknown, (level: number) => void])[1];
+    for (let i = 0; i < 11; i++) { onLevel(0.1); await vi.advanceTimersByTimeAsync(1000); }
+    expect(controller.getSnapshot()).toMatchObject({ phase: 'error', detail: 'CAPTURE_STALLED' });
+  });
+  it('surfaces processor failures immediately and ignores stale failures after pause', async () => {
+    await controller.start(); ready();
+    const onFailure = (fakes.capture.mock.calls[0] as unknown as [unknown, unknown, (code: string) => void])[2];
+    onFailure('CAPTURE_PROCESSOR_ERROR');
+    expect(controller.getSnapshot()).toMatchObject({ phase: 'error', detail: 'CAPTURE_PROCESSOR_ERROR' });
+    controller.pause(); onFailure('CAPTURE_TRACK_ENDED');
+    expect(controller.getSnapshot().phase).toBe('paused');
+  });
+  it('preserves the last capture snapshot after cleanup and later watchdog ticks', async () => {
+    await controller.start(); ready();
+    const snapshot = { ...controller.getSnapshot().capture, stage: 'capturing' as const, contextState: 'interrupted', frames: 42, workletReady: true };
+    fakes.diagnostics.mockReturnValue(snapshot);
+    fakes.stop.mockImplementationOnce(() => fakes.diagnostics.mockReturnValue(undefined));
+    const onFailure = (fakes.capture.mock.calls[0] as unknown as [unknown, unknown, (code: string) => void])[2];
+    onFailure('CAPTURE_CONTEXT_INTERRUPTED');
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(controller.getSnapshot().capture).toEqual(snapshot);
+    expect(controller.getSnapshot().detail).toBe('CAPTURE_CONTEXT_INTERRUPTED');
+  });
   it('keeps the server failure code available while reconnecting', async () => {
     await controller.start(); const { socket } = ready();
     socket.event({ type: 'error', code: 'UPSTREAM_BACKPRESSURE', message: '网络发送积压', retryable: true });
@@ -184,9 +247,9 @@ describe('classroom lifecycle', () => {
   });
   it('times out a half-open connection and bounds consecutive reconnects', async () => {
     await controller.start();
-    // 返回采音电平心跳，隔离连接恢复逻辑。
-    const onLevel = (fakes.capture.mock.calls[0] as unknown as [unknown, (level: number) => void])[1];
-    for (let i = 0; i < 180 && controller.getSnapshot().phase !== 'error'; i++) { onLevel(0.1); await vi.advanceTimersByTimeAsync(1000); }
+    // 返回实际采音帧心跳，隔离连接恢复逻辑。
+    const onFrame = (fakes.capture.mock.calls[0] as unknown as [(frame: ArrayBuffer) => void])[0];
+    for (let i = 0; i < 180 && controller.getSnapshot().phase !== 'error'; i++) { onFrame(new ArrayBuffer(1280)); await vi.advanceTimersByTimeAsync(1000); }
     expect(controller.getSnapshot().phase).toBe('error');
     expect(FakeSocket.instances.length).toBeLessThanOrEqual(6);
     expect(controller.getSnapshot().message).toContain('多次重连失败');
@@ -194,7 +257,7 @@ describe('classroom lifecycle', () => {
   it('does not open a socket if stopped while microphone permission is pending', async () => {
     let resolveCapture!: () => void;
     fakes.capture.mockImplementationOnce(() => new Promise<void>(resolve => { resolveCapture = resolve; }));
-    const starting = controller.start(); await Promise.resolve();
+    const starting = controller.start(); await vi.advanceTimersByTimeAsync(0);
     controller.end(); resolveCapture(); await starting;
     expect(FakeSocket.instances).toHaveLength(0); expect(controller.getSnapshot().phase).toBe('ended');
   });
