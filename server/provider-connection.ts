@@ -1,14 +1,23 @@
 import type { ClientRequest } from 'node:http';
 import WebSocket from 'ws';
+import { recordIp, runtimeDiagnostics } from './network-diagnostics.js';
 
 type Stage = 'connection' | 'dns' | 'tcp' | 'tls' | 'upgrade' | 'open';
 /** 仅记录阶段和耗时；不保留 URL、请求头、凭证或课堂内容。 */
 export class ConnectionTrace {
   stage: Stage = 'dns';
+  resolvedAddresses: string[] = [];
+  attemptedAddresses: string[] = [];
   private startedAt = Date.now();
   observe(request: ClientRequest) {
     request.once('socket', socket => {
-      socket.once('lookup', error => { if (!error) this.stage = 'tcp'; });
+      socket.on('lookup', (error, address) => {
+        if (!error) {
+          if (this.stage === 'dns' || this.stage === 'tcp') this.stage = 'tcp';
+          recordIp(this.resolvedAddresses, address);
+        }
+      });
+      socket.on('connectionAttempt', address => recordIp(this.attemptedAddresses, address));
       socket.once('connect', () => { this.stage = 'tls'; });
       socket.once('secureConnect', () => { this.stage = 'upgrade'; });
     });
@@ -23,7 +32,10 @@ export function createProviderSocket(url: string): WebSocket {
     finishRequest: request => { trace.observe(request); request.end(); },
   });
   traces.set(socket, trace);
-  socket.once('open', () => { trace.stage = 'open'; });
+  socket.once('open', () => {
+    trace.stage = 'open';
+    console.info('provider_connection_open', { ...runtimeDiagnostics(), elapsedMs: trace.elapsedMs, resolvedAddresses: [...trace.resolvedAddresses], attemptedAddresses: [...trace.attemptedAddresses] });
+  });
   return socket;
 }
 
@@ -40,11 +52,12 @@ export function describeProviderFailure(error: unknown, trace?: ConnectionTrace)
   const timedOut = value?.message === 'Opening handshake has timed out' || ['ETIMEDOUT', 'ESOCKETTIMEDOUT', 'ERR_SOCKET_CONNECTION_TIMEOUT'].includes(networkCode);
   const code = `PROVIDER_${stage.toUpperCase()}_${timedOut ? 'TIMEOUT' : networkCode === 'UNKNOWN' ? 'FAILED' : networkCode}`;
   const message = `后端到讯飞的${STAGE_LABELS[stage]}${timedOut ? '超时' : '失败'}，${stage === 'open' ? '传输已中断' : '尚未开始传送课堂音频'}。请查看“运行数据与排查”中的具体错误码。`;
-  return { code, message, retryable: !TLS_CODES.has(networkCode), diagnostics: { stage, networkCode, elapsedMs: trace?.elapsedMs ?? 0 } };
+  return { code, message, retryable: !TLS_CODES.has(networkCode), diagnostics: { stage, networkCode, elapsedMs: trace?.elapsedMs ?? 0,
+    resolvedAddresses: [...(trace?.resolvedAddresses ?? [])], attemptedAddresses: [...(trace?.attemptedAddresses ?? [])] } };
 }
 export function providerConnectionFailure(socket: WebSocket, error: unknown) {
   const failure = describeProviderFailure(error, traces.get(socket));
-  console.warn('provider_connection_failed', failure.diagnostics);
+  console.warn('provider_connection_failed', { ...runtimeDiagnostics(), ...failure.diagnostics });
   return failure;
 }
 export function providerConnectionTimeout(socket: WebSocket) {

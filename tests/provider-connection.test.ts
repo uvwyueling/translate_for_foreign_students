@@ -50,4 +50,21 @@ describe('safe provider connection diagnostics', () => {
     expect(output).not.toContain(secret); expect(output).not.toContain('authorization'); expect(output).not.toContain('example.test');
     expect(describeProviderFailure(error).diagnostics.networkCode).toBe('UNKNOWN');
   });
+  it('records only bounded valid target addresses for correlating failed connection attempts', () => {
+    const trace = new ConnectionTrace(), request = new EventEmitter(), socket = new EventEmitter();
+    trace.observe(request as ClientRequest); request.emit('socket', socket);
+    socket.emit('lookup', null, '192.0.2.1', 4); socket.emit('lookup', null, '192.0.2.1', 4);
+    socket.emit('lookup', new Error('lookup failed'), '192.0.2.2', 4);
+    socket.emit('lookup', null, 'signed-url-must-not-appear', 4);
+    socket.emit('connectionAttempt', '192.0.2.1', 443, 4);
+    socket.emit('connectionAttempt', '2001:db8::1', 443, 6);
+    const failure = describeProviderFailure(new Error('Opening handshake has timed out'), trace);
+    expect(failure.diagnostics).toMatchObject({ stage: 'tcp', resolvedAddresses: ['192.0.2.1'], attemptedAddresses: ['192.0.2.1', '2001:db8::1'] });
+    for (let i = 2; i < 40; i++) socket.emit('connectionAttempt', `192.0.2.${i}`, 443, 4);
+    expect(trace.attemptedAddresses).toHaveLength(16);
+    expect(failure.diagnostics.attemptedAddresses).toEqual(['192.0.2.1', '2001:db8::1']);
+    expect(JSON.stringify(failure)).not.toContain('signed-url-must-not-appear');
+    socket.emit('connect'); socket.emit('secureConnect'); socket.emit('lookup', null, '192.0.2.40', 4);
+    expect(trace.stage).toBe('upgrade');
+  });
 });
