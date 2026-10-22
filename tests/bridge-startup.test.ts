@@ -52,4 +52,17 @@ describe('backend startup acknowledgement without network access', () => {
     start(); client.close(); upstream.readyState = 1; upstream.emit('open');
     expect(client.sent).toEqual([{ type: 'connecting', sessionId: 'startup-test' }]);
   });
+  it('forwards only numeric upload diagnostics before releasing a full cloud queue', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      start(); upstream.readyState = 1; upstream.emit('open'); upstream.bufferedAmount = 65000;
+      // 模拟网络稍后集中交付，保持在桥接层的实时速率与两秒容差内。
+      await vi.advanceTimersByTimeAsync(4200);
+      for (let i = 0; i < 151; i++) client.message(Buffer.alloc(1280), true);
+      expect(client.sent.at(-1)).toMatchObject({ type: 'error', code: 'UPSTREAM_INPUT_BACKLOG', retryable: false,
+        uplink: { receivedFrames: 151, forwardedFrames: 0, queuedFrames: 150, networkBufferedBytes: 65000 } });
+      const logged = JSON.stringify(warn.mock.calls);
+      expect(logged).toContain('provider_uplink_failed'); expect(logged).not.toContain('authorization'); expect(logged).not.toContain('classroom-test');
+    } finally { warn.mockRestore(); }
+  });
 });

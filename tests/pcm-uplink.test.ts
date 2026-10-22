@@ -14,9 +14,25 @@ beforeEach(() => {
   vi.useFakeTimers(); socket = new FakeSocket(); failed = vi.fn();
   uplink = new PcmUplink(socket as unknown as WebSocket, 'app', failed); uplink.start();
 });
-afterEach(() => { uplink.stop(); vi.clearAllTimers(); vi.useRealTimers(); });
+afterEach(() => { uplink.stop(); vi.clearAllTimers(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe('paced cloud audio upload', () => {
+  it('keeps up with real-time batched input when timer callbacks are consistently 5 ms late', async () => {
+    uplink.stop();
+    const timeout = setTimeout, interval = setInterval;
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((callback: () => void, delay = 0) => timeout(callback, delay + 5)) as typeof setTimeout);
+    vi.spyOn(globalThis, 'setInterval').mockImplementation(((callback: () => void, delay = 0) => interval(callback, delay + 5)) as typeof setInterval);
+    uplink = new PcmUplink(socket as unknown as WebSocket, 'app', failed); uplink.start();
+    for (let group = 0; group < 400; group++) {
+      for (let i = 0; i < 5; i++) uplink.push(frame(group * 5 + i));
+      await vi.advanceTimersByTimeAsync(200);
+    }
+    expect(failed).not.toHaveBeenCalled();
+    expect(socket.sent.length).toBeGreaterThanOrEqual(1998);
+    expect(uplink.diagnostics).toMatchObject({ receivedFrames: 2000, forwardedFrames: socket.sent.length, networkBufferedBytes: 0, blockedMs: 0, maxTimerDelayMs: 5 });
+    expect(socket.sent.slice(1).every((item, i) => item.at - socket.sent[i].at >= 35)).toBe(true);
+    expect(socket.sent.map(item => Buffer.from(item.payload.data.audio, 'base64').readUInt16LE())).toEqual(Array.from({ length: socket.sent.length }, (_, i) => i));
+  });
   it('turns a two-second arrival burst into ordered 40 ms uploads without discarding audio', async () => {
     for (let i = 0; i < 50; i++) uplink.push(frame(i));
     expect(socket.sent).toHaveLength(1);
@@ -25,6 +41,17 @@ describe('paced cloud audio upload', () => {
     expect(socket.sent.map(item => Buffer.from(item.payload.data.audio, 'base64').readUInt16LE())).toEqual(Array.from({ length: 50 }, (_, i) => i));
     expect(socket.sent.slice(1).every((item, i) => item.at - socket.sent[i].at === 40)).toBe(true);
     expect(socket.sent.map(item => item.header.status)).toEqual([0, ...Array(49).fill(1)]);
+    expect(failed).not.toHaveBeenCalled();
+  });
+  it('lets arriving audio advance a due send even while a timer callback is delayed', async () => {
+    const timeout = setTimeout;
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((callback: () => void, delay = 0) => timeout(callback, delay + 100)) as typeof setTimeout);
+    uplink.push(frame(1)); uplink.push(frame(2));
+    await vi.advanceTimersByTimeAsync(50);
+    expect(socket.sent).toHaveLength(1);
+    uplink.push(frame(3));
+    expect(socket.sent.map(item => Buffer.from(item.payload.data.audio, 'base64').readUInt16LE())).toEqual([1, 2]);
+    expect(uplink.diagnostics.maxTimerDelayMs).toBe(10);
     expect(failed).not.toHaveBeenCalled();
   });
   it('waits through brief backpressure and then preserves the queued phrase', async () => {
@@ -48,14 +75,16 @@ describe('paced cloud audio upload', () => {
   it('stops persistent blockage instead of entering repeated automatic reconnects', async () => {
     socket.bufferedAmount = 65000; uplink.push(frame(1));
     await vi.advanceTimersByTimeAsync(6000);
-    expect(failed).toHaveBeenCalledExactlyOnceWith('UPSTREAM_BACKPRESSURE', expect.any(String), false);
+    expect(failed).toHaveBeenCalledExactlyOnceWith('UPSTREAM_BACKPRESSURE', expect.any(String), false,
+      expect.objectContaining({ queuedFrames: 1, forwardedFrames: 0, networkBufferedBytes: 65000, blockedMs: 6000 }));
     socket.bufferedAmount = 0; uplink.push(frame(2)); await vi.advanceTimersByTimeAsync(1000);
     expect(socket.sent).toHaveLength(0);
   });
   it('bounds unsent PCM even when arriving frames keep accumulating', () => {
     socket.bufferedAmount = 65000;
     for (let i = 0; i < 151; i++) uplink.push(frame(i));
-    expect(failed).toHaveBeenCalledExactlyOnceWith('UPSTREAM_INPUT_BACKLOG', expect.any(String), false);
+    expect(failed).toHaveBeenCalledExactlyOnceWith('UPSTREAM_INPUT_BACKLOG', expect.any(String), false,
+      expect.objectContaining({ receivedFrames: 151, queuedFrames: 150, peakQueuedFrames: 150, forwardedFrames: 0, networkBufferedBytes: 65000 }));
     expect(socket.sent).toHaveLength(0);
   });
   it('drops pending audio on stop and sends only one matching end frame', async () => {
@@ -63,5 +92,14 @@ describe('paced cloud audio upload', () => {
     await vi.advanceTimersByTimeAsync(1000);
     expect(socket.sent.map(item => item.header.status)).toEqual([0, 2]);
     expect(socket.sent[1].payload.data).toMatchObject({ seq: 2, audio: '' });
+  });
+  it('does not burst buffered audio after a long interval without a writable connection', async () => {
+    uplink.push(frame(1));
+    socket.bufferedAmount = 65000;
+    for (let i = 2; i <= 30; i++) uplink.push(frame(i));
+    await vi.advanceTimersByTimeAsync(2000);
+    socket.bufferedAmount = 0; await vi.advanceTimersByTimeAsync(1200);
+    expect(failed).not.toHaveBeenCalled(); expect(socket.sent).toHaveLength(30);
+    expect(socket.sent.slice(1).every((item, i) => item.at - socket.sent[i].at >= 35)).toBe(true);
   });
 });

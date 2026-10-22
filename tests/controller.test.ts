@@ -37,7 +37,7 @@ beforeEach(() => {
   vi.stubGlobal('WebSocket', FakeSocket);
   controller = new ClassroomController();
 });
-afterEach(() => { controller.dispose(); vi.useRealTimers(); vi.unstubAllGlobals(); });
+afterEach(() => { controller.dispose(); vi.restoreAllMocks(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 const last = () => FakeSocket.instances.at(-1)!;
 function ready() {
   const socket = last(); socket.open();
@@ -45,6 +45,30 @@ function ready() {
   return { socket, sessionId: start.sessionId };
 }
 describe('classroom lifecycle', () => {
+  it('does not accumulate startup-upload delay when timeout callbacks run 5 ms late', async () => {
+    const timeout = setTimeout;
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((callback: () => void, delay = 0) => timeout(callback, delay + 5)) as typeof setTimeout);
+    controller.setMode('live'); await controller.start();
+    const onFrame = (fakes.capture.mock.calls[0] as unknown as [(frame: ArrayBuffer) => void])[0];
+    for (let i = 0; i < 25; i++) onFrame(new ArrayBuffer(1280));
+    const { socket } = ready();
+    for (let group = 0; group < 300; group++) {
+      for (let i = 0; i < 5; i++) onFrame(new ArrayBuffer(1280));
+      socket.event({ type: 'pong', at: Date.now() });
+      await vi.advanceTimersByTimeAsync(200);
+    }
+    expect(controller.getSnapshot().phase).toBe('running');
+    expect(socket.frames.length).toBeGreaterThanOrEqual(1498);
+    expect(controller.getSnapshot().pendingFrames).toBeLessThanOrEqual(30);
+  });
+  it('retains cloud upload failure counters after cleanup and resets them for a new attempt', async () => {
+    await controller.start(); const { socket } = ready();
+    const uplink = { receivedFrames: 151, forwardedFrames: 0, queuedFrames: 150, peakQueuedFrames: 150, networkBufferedBytes: 65000, blockedMs: 5000, maxTimerDelayMs: 200 };
+    socket.event({ type: 'error', code: 'UPSTREAM_INPUT_BACKLOG', message: '云端发送积压', retryable: false, uplink });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(controller.getSnapshot()).toMatchObject({ phase: 'error', detail: 'UPSTREAM_INPUT_BACKLOG', uplink });
+    await controller.start(); expect(controller.getSnapshot().uplink).toBeUndefined();
+  });
   it('measures backend reachability before provider ready without sending buffered audio', async () => {
     await controller.start();
     expect(controller.getSnapshot().connectionStage).toBe('browser-connecting');

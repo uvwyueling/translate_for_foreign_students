@@ -26,7 +26,14 @@ function CaptureStatus({ state }: { state: ClassroomState }) {
     <div><small>已采集音频</small><strong>{capture.frames} 帧 / {(capture.frames * 0.04).toFixed(2)} 秒</strong></div>
     <div><small>网页已发往课堂服务</small><strong>{state.sentFrames} 帧</strong></div>
     <div><small>启动音频等待发送</small><strong>{state.pendingFrames} 帧</strong></div>
-  </div><p>故障时保留停止前的采音状态。网页发出帧数只表示已交给浏览器连接发送，不证明后端或讯飞已收到；模拟模式也可检查采音和网页发送。</p></>;
+  </div>{state.uplink && <div className="metric-grid">
+    <div><small>云端收到音频</small><strong>{state.uplink.receivedFrames} 帧</strong></div>
+    <div><small>云端发往讯飞</small><strong>{state.uplink.forwardedFrames} 帧</strong></div>
+    <div><small>云端等待发送 / 峰值</small><strong>{state.uplink.queuedFrames} / {state.uplink.peakQueuedFrames} 帧</strong></div>
+    <div><small>讯飞连接写缓冲</small><strong>{state.uplink.networkBufferedBytes} 字节</strong></div>
+    <div><small>写缓冲连续积压</small><strong>{state.uplink.blockedMs} ms</strong></div>
+    <div><small>云端发送定时器最大延后</small><strong>{state.uplink.maxTimerDelayMs} ms</strong></div>
+  </div>}<p>故障时保留停止前的采音状态。网页和云端的发出帧数只表示已交给相应连接发送，不证明讯飞已收到；模拟模式也可检查采音和网页发送。</p></>;
 }
 export default function App({ controller }: { controller: ClassroomController }) {
   const state = useSyncExternalStore(controller.subscribe, controller.getSnapshot);

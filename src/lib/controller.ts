@@ -1,4 +1,5 @@
-import { MAX_CAPTIONS, upsertCaption, type Caption, type Mode, type Phase, type ServerEvent, type SpeechMode, type Segmentation } from '../../shared/protocol';
+import { MAX_CAPTIONS, upsertCaption, type Caption, type Mode, type Phase, type ServerEvent, type SpeechMode, type Segmentation, type UplinkDiagnostics } from '../../shared/protocol';
+import { nextPcmDeadline } from '../../shared/audio-pacing';
 import { Microphone, emptyCaptureDiagnostics, type CaptureDiagnostics, type CaptureFailure } from '../audio/capture';
 import { AudioPlayer } from '../audio/player';
 import { waitForLocalEnglishVoice } from '../audio/local-voice';
@@ -17,6 +18,7 @@ export interface ClassroomState {
   volume: number; metrics: Metrics; projectionOpen: boolean;
   capture: CaptureDiagnostics; sentFrames: number; pendingFrames: number;
   connectionStage: ConnectionStage; connectionWaitMs: number;
+  uplink?: UplinkDiagnostics;
 }
 export const initialState = (): ClassroomState => ({
   phase: 'idle', mode: 'mock', speechMode: 'provider', segmentation: 'continuous', captions: [], draft: '', level: 0, microphone: 'unchecked',
@@ -56,6 +58,7 @@ export class ClassroomController {
   private startupFrames: { frame: ArrayBuffer; capturedAt: number }[] = [];
   private bufferingStartup = false;
   private uploadTimer?: ReturnType<typeof setTimeout>;
+  private nextUploadAt?: number;
   private frameTimes: number[] = [];
   private partialSeen = new Set<string>();
   private finalSeen = new Set<string>();
@@ -158,7 +161,7 @@ export class ClassroomController {
     const generation = ++this.generation;
     this.retries = 0; this.lastServiceErrorCode = ''; this.startedAt = Date.now();
     this.player.clear(true);
-    this.patch({ phase: 'connecting', playbackError: '', detail: '', sentFrames: 0, pendingFrames: 0, capture: emptyCaptureDiagnostics(), connectionStage: 'idle', connectionWaitMs: 0, message: '正在开启麦克风并连接课堂服务…请等到“课堂进行中”后开始讲课。' });
+    this.patch({ phase: 'connecting', playbackError: '', detail: '', sentFrames: 0, pendingFrames: 0, capture: emptyCaptureDiagnostics(), connectionStage: 'idle', connectionWaitMs: 0, uplink: undefined, message: '正在开启麦克风并连接课堂服务…请等到“课堂进行中”后开始讲课。' });
     try {
       await Promise.all([this.player.unlock(), this.microphone.prepare()]);
       if (generation !== this.generation) return;
@@ -197,7 +200,7 @@ export class ClassroomController {
     const socket = new WebSocket(url); this.socket = socket;
     this.connectionAt = Date.now();
     this.lastPong = Date.now();
-    this.patch({ connectionStage: 'browser-connecting', connectionWaitMs: 0 });
+    this.patch({ connectionStage: 'browser-connecting', connectionWaitMs: 0, uplink: undefined });
     socket.onopen = () => {
       if (this.socket !== socket) return;
       this.patch({ connectionStage: 'waiting-backend' });
@@ -263,6 +266,7 @@ export class ClassroomController {
       case 'handoff': this.reconnect('正在交接到新会话，交接区间可能缺少内容；请重述关键句。', true); break;
       case 'error':
         this.lastServiceErrorCode = message.code;
+        if (message.uplink) this.patch({ uplink: message.uplink });
         if (message.retryable) this.reconnect(message.message); else this.fail(message.message, message.code);
         break;
     }
@@ -284,10 +288,12 @@ export class ClassroomController {
   private flushStartupFrame() {
     if (!this.runningWanted || !this.ready || this.socket?.readyState !== WebSocket.OPEN) return;
     const next = this.startupFrames.shift();
-    if (!next) { this.bufferingStartup = false; return; }
+    if (!next) { this.bufferingStartup = false; this.nextUploadAt = undefined; return; }
+    const now = Date.now();
+    this.nextUploadAt = nextPcmDeadline(this.nextUploadAt, now);
     this.uploadFrame(next.frame, next.capturedAt);
-    // 新到的音频也进入同一队列，以 40 ms 节奏衔接，避免突发上传或句尾越过句首。
-    if (this.bufferingStartup && this.ready) this.uploadTimer = setTimeout(() => { this.uploadTimer = undefined; this.flushStartupFrame(); }, 40);
+    // 下一帧按预计时刻安排，补偿小幅回调延后，避免每帧都累加等待误差。
+    if (this.bufferingStartup && this.ready) this.uploadTimer = setTimeout(() => { this.uploadTimer = undefined; this.flushStartupFrame(); }, Math.max(1, Math.ceil(this.nextUploadAt! - Date.now())));
   }
   private uploadFrame(frame: ArrayBuffer, capturedAt: number) {
     if (!this.ready || this.socket?.readyState !== WebSocket.OPEN) return;
@@ -311,7 +317,7 @@ export class ClassroomController {
   }
   private disconnect(preserveStartupAudio = false) {
     clearTimeout(this.retryTimer); this.ready = false; this.connectionAt = 0;
-    clearTimeout(this.uploadTimer); this.uploadTimer = undefined;
+    clearTimeout(this.uploadTimer); this.uploadTimer = undefined; this.nextUploadAt = undefined;
     if (!preserveStartupAudio) { this.startupFrames = []; this.bufferingStartup = false; }
     const socket = this.socket; this.socket = undefined;
     if (socket) { socket.onopen = null; socket.onmessage = null; socket.onclose = null; socket.onerror = null; socket.close(); }
@@ -370,6 +376,7 @@ export class ClassroomController {
       lastDiagnosticCode: this.state.detail || null,
       capture: this.state.capture, sentFrames: this.state.sentFrames, pendingFrames: this.state.pendingFrames,
       connectionStage: this.state.connectionStage, connectionWaitMs: this.state.connectionWaitMs,
+      uplink: this.state.uplink ?? null,
       ...counters, partialSubtitleLatency: summarize(partialLatencyMs), finalSubtitleLatency: summarize(finalLatencyMs), recovery: summarize(recoveryMs), audioQueueWait: summarize(audioQueueWaitMs),
       captionConfirmation: summarize(captionConfirmationMs), localCaptionToSpeechStart: summarize(localSpeechStartMs),
       latestStageTimings: { captionConfirmationMs: captionConfirmationMs.at(-1) ?? null, localCaptionToSpeechStartMs: localSpeechStartMs.at(-1) ?? null },

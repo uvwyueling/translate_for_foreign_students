@@ -3,6 +3,10 @@ export type SpeechMode = 'provider' | 'local';
 export type Segmentation = 'continuous' | 'pause';
 export type Phase = 'idle' | 'checking' | 'connecting' | 'running' | 'paused' | 'reconnecting' | 'error' | 'ended';
 export interface Caption { id: string; zh: string; en: string; final: boolean; at: number }
+export interface UplinkDiagnostics {
+  receivedFrames: number; forwardedFrames: number; queuedFrames: number; peakQueuedFrames: number;
+  networkBufferedBytes: number; blockedMs: number; maxTimerDelayMs: number;
+}
 export type ServerEvent =
   | { type: 'connecting'; sessionId: string }
   | { type: 'ready'; sessionId: string; mode: Mode }
@@ -12,7 +16,7 @@ export type ServerEvent =
   | { type: 'audio'; sessionId: string; seq: number; pcm: string; sampleRate: number }
   | { type: 'mock-speech'; sessionId: string; seq: number; text: string }
   | { type: 'handoff'; sessionId: string }
-  | { type: 'error'; code: string; message: string; retryable: boolean };
+  | { type: 'error'; code: string; message: string; retryable: boolean; uplink?: UplinkDiagnostics };
 export const MAX_CAPTIONS = 60;
 export function upsertCaption(rows: Caption[], row: Caption): Caption[] {
   const index = rows.findIndex(item => item.id === row.id);

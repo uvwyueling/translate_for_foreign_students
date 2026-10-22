@@ -1,7 +1,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import WebSocket, { WebSocketServer } from 'ws';
-import type { Mode, ServerEvent } from '../shared/protocol.js';
+import type { Mode, ServerEvent, UplinkDiagnostics } from '../shared/protocol.js';
 import { signedUrl, VendorDecoder, type Credentials } from './xfyun.js';
 import { PausePipeline } from './pause-pipeline.js';
 import { PcmUplink } from './pcm-uplink.js';
@@ -65,7 +65,10 @@ export function attachBridge(wss: WebSocketServer, config: BridgeConfig) {
       if (upstream && upstream.readyState !== WebSocket.CLOSED) { const u = upstream; const t = setTimeout(() => u.terminate(), 1000); t.unref(); }
       socket.close();
     };
-    const fail = (code: string, message: string, retryable: boolean) => { emit({ type: 'error', code, message, retryable }); close(); };
+    const fail = (code: string, message: string, retryable: boolean, uplink?: UplinkDiagnostics) => {
+      if (uplink) console.warn('provider_uplink_failed', { code, ...uplink, runtimeRegion: process.env.VERCEL_REGION ?? 'local', revision: process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 12) ?? '' });
+      emit({ type: 'error', code, message, retryable, ...(uplink ? { uplink } : {}) }); close();
+    };
     const watchdog = setInterval(() => {
       if (Date.now() - lastPing > 20000) return fail('HEARTBEAT_TIMEOUT', '连接没有响应，正在重新建立连接。', true);
       if (ready && mode === 'live' && Date.now() - lastAudio > 12000) return fail('NO_AUDIO', '没有收到麦克风音频，请检查设备后手动重试。', false);
