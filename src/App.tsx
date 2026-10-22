@@ -1,5 +1,5 @@
 import { useEffect, useState, useSyncExternalStore } from 'react';
-import { ClassroomController, phaseLabels, type ClassroomState } from './lib/controller';
+import { ClassroomController, connectionLabels, phaseLabels, type ClassroomState } from './lib/controller';
 import { summarize } from './lib/metrics';
 import type { Caption } from '../shared/protocol';
 
@@ -16,6 +16,8 @@ function CaptureStatus({ state }: { state: ClassroomState }) {
   const stages = { idle: '尚未启动', permission: '等待麦克风授权', resuming: '正在启动浏览器音频', worklet: '正在加载采音模块', capturing: '采音已启动', stopped: '已停止' };
   const capture = state.capture;
   return <><div className="metric-grid">
+    <div><small>课堂连接阶段</small><strong>{connectionLabels[state.connectionStage]}</strong></div>
+    <div><small>本次连接等待</small><strong>{(state.connectionWaitMs / 1000).toFixed(2)} 秒</strong></div>
     <div><small>采音阶段</small><strong>{stages[capture.stage]}</strong></div>
     <div><small>浏览器采音状态 / 采样率</small><strong>{capture.contextState} / {capture.sampleRate ?? '—'} Hz</strong></div>
     <div><small>麦克风通道</small><strong>{capture.trackState === 'unavailable' ? '尚未取得' : capture.trackState === 'ended' ? '已断开' : !capture.trackEnabled ? '已禁用' : capture.trackMuted ? '系统暂时静音' : '正常'}</strong></div>
@@ -58,8 +60,6 @@ export default function App({ controller }: { controller: ClassroomController })
             <div className="status-message" role="status">{state.message}</div>
             {active ? <button className="primary large" onClick={() => controller.pause()}>Ⅱ　暂停课堂</button> : <button className="primary large" disabled={state.phase === 'checking' || (state.mode === 'live' && !state.liveConfigured)} onClick={() => void controller.start()}>{state.phase === 'paused' ? '▶　继续课堂' : state.phase === 'error' ? '↻　手动重试' : '▶　开始课堂'}</button>}
             <button className="end-button" disabled={['idle', 'ended'].includes(state.phase)} onClick={() => controller.end()}>结束课堂</button>
-            {state.mode === 'live' && <div className="speech-mode-field"><label className="field-label" htmlFor="segmentation">分句方式</label><select id="segmentation" value={state.segmentation} disabled={busy} onChange={e => controller.setSegmentation(e.target.value as 'continuous' | 'pause')}><option value="continuous">连续同传（原方式）</option><option value="pause">停顿后尽快送译（实验）</option></select><p className="helper">{state.segmentation === 'pause' ? '停顿约 0.8 秒后收尾送译，再自动接下一段。较长的句内停顿也可能分句，请检查漏字和翻译完整性。' : '保持连续会话，由服务判断分句。短句说完后可能等待较久。'}</p></div>}
-            {state.mode === 'live' && <div className="speech-mode-field"><label className="field-label" htmlFor="speech-mode">英文声音来源</label><select id="speech-mode" value={state.speechMode} disabled={busy} onChange={e => controller.setSpeechMode(e.target.value as 'provider' | 'local')}><option value="provider">讯飞英文语音（原方式）</option><option value="local">本机朗读英文字幕（对比测试）</option></select><p className="helper">{state.speechMode === 'local' ? '收到已确认的英文字幕后，用本机英语语音朗读。不播放讯飞声音；效果和速度需实测，待播时长为估算。' : '播放讯飞返回的英文语音。若每句等待较长，可结束后切换本机朗读做对比。'}</p></div>}
             <div className="audio-heading"><span>英文播放</span><span className="muted">{state.playing ? '正在播放' : '等待语音'}</span></div>
             <label className="volume"><span>音量</span><input type="range" min="0" max="1" step="0.05" value={state.volume} onChange={e => controller.setVolume(Number(e.target.value))}/><span>{Math.round(state.volume * 100)}%</span></label>
             <div className={`queue ${state.queueSeconds > 15 ? 'warning' : ''}`}><div><strong>{state.queueSeconds.toFixed(1)}<small> 秒</small></strong><span>待播时长{state.mode === 'mock' || state.speechMode === 'local' ? '（估算）' : ''}</span></div><button onClick={() => controller.clearQueue()} disabled={!active && state.queueSeconds === 0}>清空待播<br/>回到当前</button></div>

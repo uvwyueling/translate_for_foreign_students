@@ -4,6 +4,11 @@ import { AudioPlayer } from '../audio/player';
 import { waitForLocalEnglishVoice } from '../audio/local-voice';
 import { emptyMetrics, sample, summarize, type Metrics } from './metrics';
 
+export type ConnectionStage = 'idle' | 'browser-connecting' | 'waiting-backend' | 'provider-connecting' | 'ready';
+export const connectionLabels: Record<ConnectionStage, string> = {
+  idle: '尚未连接', 'browser-connecting': '正在建立网页连接', 'waiting-backend': '网页连接已建立，等待后端启动确认',
+  'provider-connecting': '后端已确认，正在连接讯飞', ready: '课堂服务已就绪',
+};
 export interface ClassroomState {
   phase: Phase; mode: Mode; speechMode: SpeechMode; segmentation: Segmentation; captions: Caption[]; draft: string; level: number;
   microphone: 'unchecked' | 'checking' | 'ok' | 'silent' | 'error';
@@ -11,12 +16,14 @@ export interface ClassroomState {
   message: string; detail: string; playbackError: string; queueSeconds: number; playing: boolean;
   volume: number; metrics: Metrics; projectionOpen: boolean;
   capture: CaptureDiagnostics; sentFrames: number; pendingFrames: number;
+  connectionStage: ConnectionStage; connectionWaitMs: number;
 }
 export const initialState = (): ClassroomState => ({
   phase: 'idle', mode: 'mock', speechMode: 'provider', segmentation: 'continuous', captions: [], draft: '', level: 0, microphone: 'unchecked',
   service: 'unchecked', liveConfigured: false, message: '先完成课前检查，再开始课堂。', detail: '',
   playbackError: '', queueSeconds: 0, playing: false, volume: 0.8, metrics: emptyMetrics(), projectionOpen: false,
   capture: emptyCaptureDiagnostics(), sentFrames: 0, pendingFrames: 0,
+  connectionStage: 'idle', connectionWaitMs: 0,
 });
 export const phaseLabels: Record<Phase, string> = { idle: '待开始', checking: '课前检查中', connecting: '正在连接', running: '课堂进行中', paused: '已暂停', reconnecting: '正在重连', error: '需要处理', ended: '课堂已结束' };
 export function browserCapabilities() {
@@ -151,7 +158,7 @@ export class ClassroomController {
     const generation = ++this.generation;
     this.retries = 0; this.lastServiceErrorCode = ''; this.startedAt = Date.now();
     this.player.clear(true);
-    this.patch({ phase: 'connecting', playbackError: '', detail: '', sentFrames: 0, pendingFrames: 0, capture: emptyCaptureDiagnostics(), message: '正在开启麦克风并连接课堂服务…请等到“课堂进行中”后开始讲课。' });
+    this.patch({ phase: 'connecting', playbackError: '', detail: '', sentFrames: 0, pendingFrames: 0, capture: emptyCaptureDiagnostics(), connectionStage: 'idle', connectionWaitMs: 0, message: '正在开启麦克风并连接课堂服务…请等到“课堂进行中”后开始讲课。' });
     try {
       await Promise.all([this.player.unlock(), this.microphone.prepare()]);
       if (generation !== this.generation) return;
@@ -190,7 +197,12 @@ export class ClassroomController {
     const socket = new WebSocket(url); this.socket = socket;
     this.connectionAt = Date.now();
     this.lastPong = Date.now();
-    socket.onopen = () => { if (this.socket === socket) socket.send(JSON.stringify({ type: 'start', mode: this.state.mode, speechMode: this.state.speechMode, segmentation: this.state.segmentation, sessionId, token: this.token })); };
+    this.patch({ connectionStage: 'browser-connecting', connectionWaitMs: 0 });
+    socket.onopen = () => {
+      if (this.socket !== socket) return;
+      this.patch({ connectionStage: 'waiting-backend' });
+      socket.send(JSON.stringify({ type: 'start', mode: this.state.mode, speechMode: this.state.speechMode, segmentation: this.state.segmentation, sessionId, token: this.token }));
+    };
     socket.onmessage = event => {
       if (this.socket !== socket || !this.runningWanted) return;
       try {
@@ -204,11 +216,14 @@ export class ClassroomController {
   }
   private receive(message: ServerEvent) {
     switch (message.type) {
+      case 'connecting':
+        if (!this.ready) this.patch({ connectionStage: 'provider-connecting' });
+        break;
       case 'ready':
         this.ready = true;
         this.startedAt = Date.now();
         if (this.recoveryAt) { sample(this.state.metrics.recoveryMs, Date.now() - this.recoveryAt); this.recoveryAt = 0; }
-        this.patch({ phase: 'running', service: 'ok', message: this.state.mode === 'mock' ? '模拟课堂进行中：字幕为固定示例，语音由浏览器朗读，与实际讲话无关。' : this.state.segmentation === 'pause' ? '停顿送译实验进行中：停顿约 0.8 秒后自动收尾并接下一段，请关注断句和翻译完整性。' : this.state.speechMode === 'local' ? '正在采集中文。收到已确认的英文字幕后，由本机英语语音朗读。' : '正在采集中文。字幕与英文语音将陆续返回。', detail: '' });
+        this.patch({ phase: 'running', service: 'ok', connectionStage: 'ready', connectionWaitMs: Date.now() - this.connectionAt, message: this.state.mode === 'mock' ? '模拟课堂进行中：字幕为固定示例，语音由浏览器朗读，与实际讲话无关。' : this.state.segmentation === 'pause' ? '停顿送译实验进行中：停顿约 0.8 秒后自动收尾并接下一段，请关注断句和翻译完整性。' : this.state.speechMode === 'local' ? '正在采集中文。收到已确认的英文字幕后，由本机英语语音朗读。' : '正在采集中文。字幕与英文语音将陆续返回。', detail: '' });
         if (this.bufferingStartup && !this.uploadTimer) this.flushStartupFrame();
         break;
       case 'pong': this.lastPong = Date.now(); this.state.metrics.rttMs = Date.now() - message.at; break;
@@ -258,7 +273,9 @@ export class ClassroomController {
     const capturedAt = performance.now();
     if (this.bufferingStartup) {
       // 只暂存本次点击开始/继续后采到的音频，最多 12 秒（384 KB），不丢掉句首。
-      if (this.startupFrames.length >= 300) { this.fail('课堂连接等待过久，启动语音暂存已满。请检查网络后重试，并重述刚才的内容。', 'STARTUP_AUDIO_LIMIT'); return; }
+      if (this.startupFrames.length >= 300) {
+        this.fail(this.ready ? '启动音频等待发送已达 12 秒上限，已停止采音。请检查网络后重试，并重述刚才的内容。' : `课堂连接尚未就绪（${connectionLabels[this.state.connectionStage]}），12 秒启动音频暂存已满，已停止采音。请查看连接阶段和服务错误码。`, 'STARTUP_AUDIO_LIMIT'); return;
+      }
       this.startupFrames.push({ frame, capturedAt });
       return;
     }
@@ -282,13 +299,14 @@ export class ClassroomController {
   }
   private reconnect(message: string, handoff = false) {
     if (!this.runningWanted) return;
+    const connectionWaitMs = this.ready || !this.connectionAt ? this.state.connectionWaitMs : Date.now() - this.connectionAt;
     this.disconnect(); this.player.clear(true); this.state.metrics.interruptions++;
     this.recoveryAt ||= Date.now();
     if (!handoff && this.retries >= 5) { this.fail('多次重连失败，已停止采音。请检查网络后手动重试。', this.lastServiceErrorCode ? `RETRY_EXHAUSTED / ${this.lastServiceErrorCode}` : 'RETRY_EXHAUSTED'); return; }
     if (handoff) this.retries = 0;
     const delay = handoff ? 250 : Math.min(1000 * 2 ** this.retries++, 16000);
     this.state.metrics.reconnects++;
-    this.patch({ phase: 'reconnecting', level: 0, draft: '', message, detail: `${this.lastServiceErrorCode ? `${this.lastServiceErrorCode} · ` : ''}将在 ${(delay / 1000).toFixed(1)} 秒后重建会话。已有字幕保留。` });
+    this.patch({ phase: 'reconnecting', level: 0, draft: '', message, connectionWaitMs, detail: `${this.lastServiceErrorCode ? `${this.lastServiceErrorCode} · ` : ''}将在 ${(delay / 1000).toFixed(1)} 秒后重建会话。已有字幕保留。` });
     this.retryTimer = setTimeout(() => this.connect(), delay);
   }
   private disconnect(preserveStartupAudio = false) {
@@ -301,7 +319,9 @@ export class ClassroomController {
   }
   private fail(message: string, detail: string) {
     const capture = this.microphone.diagnostics, pendingFrames = this.startupFrames.length;
-    this.stopResources(); this.patch({ phase: 'error', message, detail, level: 0, draft: '', capture, pendingFrames });
+    const connectionWaitMs = this.ready || !this.connectionAt ? this.state.connectionWaitMs : Date.now() - this.connectionAt;
+    if (detail === 'STARTUP_AUDIO_LIMIT' && this.lastServiceErrorCode) detail += ` / 最近服务错误：${this.lastServiceErrorCode}`;
+    this.stopResources(); this.patch({ phase: 'error', message, detail, level: 0, draft: '', capture, pendingFrames, connectionWaitMs });
   }
   private stopResources() {
     this.runningWanted = false; this.frameAt = undefined; this.audioStartingAt = undefined;
@@ -323,7 +343,8 @@ export class ClassroomController {
   private tick() {
     if (this.runningWanted) this.state.metrics.activeSeconds++;
     this.state.metrics.maxQueueSeconds = Math.max(this.state.metrics.maxQueueSeconds, this.player.seconds);
-    if (this.runningWanted && this.ready && this.socket?.readyState === WebSocket.OPEN) {
+    // 等待讯飞期间也测量网页到后端的往返，避免把“未就绪”等同于“网页连接未建立”。
+    if (this.runningWanted && this.socket?.readyState === WebSocket.OPEN) {
       if (Date.now() - this.lastPong > 15000) this.reconnect('连接长时间没有响应，正在重试。');
       else this.socket.send(JSON.stringify({ type: 'ping', at: Date.now() }));
     }
@@ -338,6 +359,7 @@ export class ClassroomController {
     if (this.player.stalled) this.patch({ playbackError: '英文音频存在缺片，请清空待播或手动重试。' });
     if (this.startedAt && this.ready && Date.now() - this.startedAt > 30000) this.retries = 0;
     this.patch({ queueSeconds: this.player.seconds, playing: this.player.isPlaying, metrics: { ...this.state.metrics }, projectionOpen: !!this.projection && !this.projection.closed,
+      ...(this.runningWanted && !this.ready && this.connectionAt ? { connectionWaitMs: Date.now() - this.connectionAt } : {}),
       ...(this.state.phase === 'error' ? {} : { capture: this.microphone.diagnostics, pendingFrames: this.startupFrames.length }) });
   }
   exportMetrics() {
@@ -347,6 +369,7 @@ export class ClassroomController {
       lastServiceErrorCode: this.lastServiceErrorCode || null,
       lastDiagnosticCode: this.state.detail || null,
       capture: this.state.capture, sentFrames: this.state.sentFrames, pendingFrames: this.state.pendingFrames,
+      connectionStage: this.state.connectionStage, connectionWaitMs: this.state.connectionWaitMs,
       ...counters, partialSubtitleLatency: summarize(partialLatencyMs), finalSubtitleLatency: summarize(finalLatencyMs), recovery: summarize(recoveryMs), audioQueueWait: summarize(audioQueueWaitMs),
       captionConfirmation: summarize(captionConfirmationMs), localCaptionToSpeechStart: summarize(localSpeechStartMs),
       latestStageTimings: { captionConfirmationMs: captionConfirmationMs.at(-1) ?? null, localCaptionToSpeechStartMs: localSpeechStartMs.at(-1) ?? null },

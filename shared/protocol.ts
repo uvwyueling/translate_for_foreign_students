@@ -4,6 +4,7 @@ export type Segmentation = 'continuous' | 'pause';
 export type Phase = 'idle' | 'checking' | 'connecting' | 'running' | 'paused' | 'reconnecting' | 'error' | 'ended';
 export interface Caption { id: string; zh: string; en: string; final: boolean; at: number }
 export type ServerEvent =
+  | { type: 'connecting'; sessionId: string }
   | { type: 'ready'; sessionId: string; mode: Mode }
   | { type: 'pong'; at: number }
   | { type: 'recognition'; sessionId: string; text: string; final: boolean; endMs: number }

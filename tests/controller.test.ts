@@ -15,7 +15,7 @@ import { ClassroomController } from '../src/lib/controller';
 class FakeSocket {
   static OPEN = 1;
   static instances: FakeSocket[] = [];
-  readyState = 1; bufferedAmount = 0;
+  readyState = 0; bufferedAmount = 0;
   onopen: (() => void) | null = null;
   onclose: (() => void) | null = null;
   onmessage: ((e: { data: string }) => void) | null = null;
@@ -25,7 +25,7 @@ class FakeSocket {
   constructor() { FakeSocket.instances.push(this); }
   send(value: string | ArrayBuffer) { if (typeof value === 'string') this.sent.push(value); else this.frames.push(value); }
   close() { this.readyState = 3; }
-  open() { this.onopen?.(); }
+  open() { this.readyState = 1; this.onopen?.(); }
   event(value: unknown) { this.onmessage?.({ data: JSON.stringify(value) }); }
 }
 let controller: ClassroomController;
@@ -45,6 +45,42 @@ function ready() {
   return { socket, sessionId: start.sessionId };
 }
 describe('classroom lifecycle', () => {
+  it('measures backend reachability before provider ready without sending buffered audio', async () => {
+    await controller.start();
+    expect(controller.getSnapshot().connectionStage).toBe('browser-connecting');
+    const socket = last(); socket.open();
+    expect(controller.getSnapshot().connectionStage).toBe('waiting-backend');
+    const sessionId = JSON.parse(socket.sent[0]).sessionId;
+    socket.event({ type: 'connecting', sessionId });
+    expect(controller.getSnapshot().connectionStage).toBe('provider-connecting');
+    const onFrame = (fakes.capture.mock.calls[0] as unknown as [(frame: ArrayBuffer) => void])[0];
+    onFrame(new ArrayBuffer(1280)); await vi.advanceTimersByTimeAsync(1000);
+    const ping = JSON.parse(socket.sent.at(-1)!);
+    expect(ping.type).toBe('ping');
+    await vi.advanceTimersByTimeAsync(100); socket.event({ type: 'pong', at: ping.at });
+    expect(controller.getSnapshot().metrics.rttMs).toBe(100);
+    expect(controller.getSnapshot().phase).toBe('connecting'); expect(socket.frames).toHaveLength(0);
+    socket.event({ type: 'ready', sessionId, mode: 'mock' });
+    expect(controller.getSnapshot()).toMatchObject({ phase: 'running', connectionStage: 'ready', connectionWaitMs: 1100 });
+    expect(socket.frames).toHaveLength(1);
+  });
+  it.each(['browser-connecting', 'waiting-backend', 'provider-connecting'] as const)('retains %s when the startup buffer fills', async stage => {
+    await controller.start(); const socket = last();
+    if (stage !== 'browser-connecting') socket.open();
+    if (stage === 'provider-connecting') socket.event({ type: 'connecting', sessionId: JSON.parse(socket.sent[0]).sessionId });
+    const onFrame = (fakes.capture.mock.calls[0] as unknown as [(frame: ArrayBuffer) => void])[0];
+    await vi.advanceTimersByTimeAsync(1000);
+    for (let i = 0; i < 301; i++) onFrame(new ArrayBuffer(1280));
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(controller.getSnapshot()).toMatchObject({ phase: 'error', detail: 'STARTUP_AUDIO_LIMIT', connectionStage: stage, connectionWaitMs: 1000, pendingFrames: 300, sentFrames: 0 });
+    expect(socket.frames).toHaveLength(0);
+  });
+  it('ignores provider startup acknowledgements from old sessions or after ready', async () => {
+    await controller.start(); const { socket, sessionId } = ready();
+    socket.event({ type: 'connecting', sessionId: 'stale-session' });
+    socket.event({ type: 'connecting', sessionId });
+    expect(controller.getSnapshot().connectionStage).toBe('ready');
+  });
   it('does not count idle time or a pending microphone permission as stalled capture', async () => {
     await vi.advanceTimersByTimeAsync(20000);
     let resolveCapture!: () => void;

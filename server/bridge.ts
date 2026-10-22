@@ -116,6 +116,8 @@ export function attachBridge(wss: WebSocketServer, config: BridgeConfig) {
         }
         if (!config.credentials || !config.accessToken) return fail('NOT_CONFIGURED', '真实同传尚未配置，请联系项目负责人或使用模拟模式。', false);
         if (!tokenMatches(message.token, config.accessToken)) return fail('UNAUTHORIZED', '课堂口令不正确，请检查后重试。', false);
+        // 确认后端已收到并通过课堂启动检查；不代表讯飞已连接或允许上传音频。
+        emit({ type: 'connecting', sessionId });
         if (message.segmentation === 'pause') {
           pausePipeline = new PausePipeline(config.credentials, event => {
             emit('sessionId' in event ? { ...event, sessionId } : event);
