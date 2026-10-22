@@ -6,6 +6,7 @@ import { signedUrl, VendorDecoder, type Credentials } from './xfyun.js';
 import { PausePipeline } from './pause-pipeline.js';
 import { PcmUplink } from './pcm-uplink.js';
 import { createProviderSocket, providerConnectionFailure, providerConnectionTimeout } from './provider-connection.js';
+import { runtimeDiagnostics } from './network-diagnostics.js';
 
 const EXAMPLES = [
   ['同学们好，今天我们讨论如何提出一个清晰的问题。', 'Hello everyone. Today we will discuss how to ask a clear question.'],
@@ -24,8 +25,9 @@ export function readConfig(): BridgeConfig {
   };
 }
 export function health(config: BridgeConfig) {
+  const { runtimeRegion, revision } = runtimeDiagnostics();
   return { ok: true, liveConfigured: !!config.credentials && !!config.accessToken, mockAvailable: true, sessionMaxSeconds: config.maxSeconds ?? 240,
-    runtimeRegion: process.env.VERCEL_REGION ?? 'local', revision: process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 12) ?? '' };
+    runtimeRegion, revision };
 }
 export function tokenMatches(value: unknown, expected?: string): boolean {
   if (typeof value !== 'string' || !expected) return false;
@@ -66,7 +68,7 @@ export function attachBridge(wss: WebSocketServer, config: BridgeConfig) {
       socket.close();
     };
     const fail = (code: string, message: string, retryable: boolean, uplink?: UplinkDiagnostics) => {
-      if (uplink) console.warn('provider_uplink_failed', { code, ...uplink, runtimeRegion: process.env.VERCEL_REGION ?? 'local', revision: process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 12) ?? '' });
+      if (uplink) console.warn('provider_uplink_failed', { code, ...uplink, ...runtimeDiagnostics() });
       emit({ type: 'error', code, message, retryable, ...(uplink ? { uplink } : {}) }); close();
     };
     const watchdog = setInterval(() => {

@@ -1,0 +1,24 @@
+# 构建上下文仅包含所需源码，开发凭证、日志、录音与运行报告不上传。
+**
+!package.json
+!package-lock.json
+!index.html
+!vite.config.ts
+!tsconfig.json
+!tsconfig.server.json
+!tsconfig.container.json
+!src/
+!src/**
+!shared/
+!shared/**
+!server/
+!server/**
+!api/
+!api/**
+!public/
+!public/**
+**/.env*
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx

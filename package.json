@@ -9,10 +9,13 @@
   "scripts": {
     "dev": "concurrently -k \"tsx watch server/local.ts\" \"vite --host 127.0.0.1\"",
     "build": "tsc --noEmit && tsc -p tsconfig.server.json && vite build",
+    "build:container": "npm run build && tsc -p tsconfig.container.json",
     "start": "tsx server/local.ts",
+    "start:container": "node .cache/container-runtime/server/container.js",
     "test": "vitest run --dir tests",
-    "check": "npm run build && npm test && npm run test:server-runtime",
+    "check": "npm run build:container && npm test && npm run test:server-runtime && node --test scripts/container-runtime.test.mjs",
     "test:server-runtime": "tsc -p tsconfig.server.json --noEmit false --allowImportingTsExtensions false && node --test scripts/server-runtime.test.mjs",
+    "test:container-runtime": "npm run build:container && node --test scripts/container-runtime.test.mjs",
     "test:soak": "tsx scripts/soak.ts"
   },
   "dependencies": {
